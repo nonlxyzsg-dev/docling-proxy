@@ -755,15 +755,14 @@ async def proxy(request: Request, path: str):
         # ── Picture Description: описание картинок через VLM ──
         if do_pic_desc == "true":
             keys_data = [k for k, _ in data]
-            if do_pic_custom == "true":
-                if "picture_description_custom_config" not in keys_data:
-                    data.append(("picture_description_custom_config", build_custom_model(vlm_overrides, classification=do_classification)))
-                    print("Режим: picture_description_custom_config")
-            else:
-                if "picture_description_api" not in keys_data:
-                    api_json = build_picture_description_api(vlm_overrides)
-                    data.append(("picture_description_api", api_json))
-                    print("Режим: picture_description_api")
+            # Всегда используем picture_description_api — поддерживает concurrency
+            # picture_description_custom_config НЕ поддерживает параллельную обработку
+            # (переход на custom_config был из-за thinking mode, но агентная инстанция + /no_think решает это)
+            if "picture_description_api" not in keys_data:
+                api_json = build_picture_description_api(vlm_overrides)
+                _conc = int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY))
+                data.append(("picture_description_api", api_json))
+                print(f"Режим: picture_description_api (concurrency={_conc})")
 
 		# Сохранение параметров для отладки
         save(data, files)
@@ -789,24 +788,8 @@ async def proxy(request: Request, path: str):
         _total_ms = (time.time() - _t_total) * 1000
         print(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
         
-        # Инъекция предупреждения о большом документе
-        _resp_content = resp.content
-        if resp.status_code == 200 and '_processing_warning' in dir() and _processing_warning:
-            try:
-                _resp_data = json.loads(_resp_content)
-                _doc = _resp_data.get("document", {})
-                _md = _doc.get("md_content", "")
-                if _md:
-                    _warning_block = f"> ⚠️ {_processing_warning}\n\n"
-                    _doc["md_content"] = _warning_block + _md
-                    _resp_data["document"] = _doc
-                    _resp_content = json.dumps(_resp_data, ensure_ascii=False).encode()
-                    print(f"Injected processing warning into response")
-            except Exception as e:
-                print(f"Warning injection error: {e}")
-        
         # Пост-обработка: KaTeX-совместимость
-        fixed_content = fix_katex_compatibility(_resp_content) if resp.status_code == 200 else _resp_content
+        fixed_content = fix_katex_compatibility(resp.content) if resp.status_code == 200 else resp.content
         
         # Убираем Content-Length — он мог измениться после KaTeX fix
         resp_headers = dict(resp.headers)
