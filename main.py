@@ -160,6 +160,132 @@ async def convert_via_gotenberg(client: httpx.AsyncClient, file_bytes: bytes, fi
         raise Exception(f"Gotenberg conversion failed: HTTP {resp.status_code}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Детекция и обработка .DOC файлов
+# ═══════════════════════════════════════════════════════════════
+
+def is_confluence_doc(file_bytes: bytes) -> bool:
+    """Check if .doc file is actually a Confluence MIME HTML export.
+    
+    Confluence exports .doc files that are really MIME-encoded HTML
+    (Content-Type: text/html, Content-Transfer-Encoding: quoted-printable).
+    """
+    try:
+        header = file_bytes[:2000].decode('utf-8', errors='ignore')
+        if 'MIME-Version' in header and ('Content-Type' in header or 'boundary=' in header):
+            return True
+        if 'Exported From Confluence' in header:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def decode_confluence_doc(file_bytes: bytes, filename: str) -> tuple:
+    """Decode Confluence MIME HTML .doc to plain HTML.
+    
+    Returns (html_bytes, html_filename) or (None, None) on failure.
+    """
+    import email
+    import quopri
+    
+    try:
+        msg = email.message_from_bytes(file_bytes)
+        
+        # Multipart: find HTML part
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == 'text/html':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        html_name = filename.rsplit('.', 1)[0] + '.html'
+                        print(f"Confluence decode: found HTML part ({len(payload)} bytes)")
+                        return payload, html_name
+        
+        # Single part
+        payload = msg.get_payload(decode=True)
+        if payload:
+            html_name = filename.rsplit('.', 1)[0] + '.html'
+            return payload, html_name
+        
+        # Fallback: find <html in raw content and decode quopri
+        raw = file_bytes.decode('utf-8', errors='ignore')
+        for marker in ('<html', '<HTML', '<!DOCTYPE'):
+            idx = raw.find(marker)
+            if idx >= 0:
+                html_part = raw[idx:]
+                decoded = quopri.decodestring(html_part.encode('utf-8', errors='ignore'))
+                html_name = filename.rsplit('.', 1)[0] + '.html'
+                print(f"Confluence decode: fallback quopri ({len(decoded)} bytes)")
+                return decoded, html_name
+        
+        print(f"Confluence decode: could not extract HTML from {filename}")
+        return None, None
+    except Exception as e:
+        print(f"Confluence decode ERROR: {e}")
+        return None, None
+
+
+def count_pdf_images(pdf_bytes: bytes) -> int:
+    """Count total images across all pages of a PDF."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total = 0
+        for page in doc:
+            total += len(page.get_images())
+        doc.close()
+        return total
+    except Exception:
+        return 0
+
+
+def get_processing_warning(filename: str, page_count: int, image_count: int, is_scan: bool, vlm_concurrency: int = 14) -> str:
+    """Generate a user-friendly warning about document processing time with ETA."""
+    import math
+    
+    parts = []
+    if page_count > 20:
+        parts.append(f"{page_count} страниц")
+    if image_count > 10:
+        parts.append(f"{image_count} изображений")
+    if is_scan:
+        parts.append("отсканированный документ")
+    
+    if not parts:
+        return ""
+    
+    # Оценка времени обработки
+    est_seconds = 0
+    if is_scan:
+        # Скан: каждая страница → VLM запрос, параллельно по vlm_concurrency
+        batches = math.ceil(page_count / vlm_concurrency)
+        est_seconds = batches * 20
+    else:
+        # TEXT PDF > 20 стр. → standard pipeline
+        est_seconds = page_count * 0.2  # нативное извлечение текста
+        if image_count > 0:
+            # + VLM для картинок параллельно по vlm_concurrency
+            img_batches = math.ceil(image_count / vlm_concurrency)
+            est_seconds += img_batches * 20
+    
+    detail = ", ".join(parts)
+    
+    if est_seconds >= 60:
+        est_min = math.ceil(est_seconds / 60)
+        time_str = f"~{est_min} мин"
+    elif est_seconds >= 10:
+        time_str = f"~{int(est_seconds)} сек"
+    else:
+        return ""  # слишком быстро, предупреждение не нужно
+    
+    return (
+        f"Документ «{filename}» содержит {detail}. "
+        f"Ориентировочное время обработки: {time_str}."
+    )
+
+
+
 def build_picture_description_api(vlm_overrides: dict) -> str:
     params = {"model": vlm_overrides.get("vlm_model", DEFAULT_VLM_MODEL), "chat_template_kwargs": {"enable_thinking": False}}
     if "vlm_temperature" in vlm_overrides:
@@ -350,6 +476,59 @@ def convert_xls_to_markdown(file_bytes: bytes, filename: str) -> bytes:
         return None
 
 
+async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, filename: str) -> bytes:
+    """Convert binary .doc to markdown via Gotenberg (doc→PDF) + PyMuPDF (PDF→text).
+    
+    Analogous to convert_xls_to_markdown — returns docling-compatible JSON response.
+    """
+    try:
+        # Шаг 1: .doc → PDF через Gotenberg
+        _t = time.time()
+        gotenberg_url = f"{GOTENBERG_URL}/forms/libreoffice/convert"
+        files = [("files", (filename, file_bytes, "application/msword"))]
+        resp = await client.post(gotenberg_url, files=files, timeout=120.0)
+        if resp.status_code != 200:
+            print(f"DOC→PDF Gotenberg failed: HTTP {resp.status_code}")
+            return None
+        pdf_bytes = resp.content
+        _gotenberg_ms = (time.time() - _t) * 1000
+        print(f"TIMING doc→pdf (Gotenberg): {_gotenberg_ms:.0f}ms ({len(pdf_bytes)} bytes)")
+        
+        # Шаг 2: PDF → markdown через PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        all_md = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text("text").strip()
+            if text:
+                all_md.append(text)
+            # Разделитель страниц
+            if page_num < len(doc) - 1 and text:
+                all_md.append("")
+                all_md.append("---")
+                all_md.append("")
+        doc.close()
+        
+        md_content = "\n".join(all_md)
+        _total_ms = (time.time() - _t) * 1000
+        print(f"TIMING doc→markdown total: {_total_ms:.0f}ms ({len(md_content)} chars)")
+        
+        response = {
+            "document": {
+                "filename": filename,
+                "md_content": md_content,
+            },
+            "status": "success",
+            "errors": [],
+            "processing_time": (time.time() - _t),
+        }
+        return json.dumps(response, ensure_ascii=False).encode()
+    except Exception as e:
+        print(f"DOC conversion error: {e}")
+        return None
+
+
+
 # ═══════════════════════════════════════════════════════════════
 # Основной прокси
 # ═══════════════════════════════════════════════════════════════
@@ -417,6 +596,42 @@ async def proxy(request: Request, path: str):
                     return Response(content=xls_result, status_code=200, headers=resp_headers)
                 else:
                     print(f"XLS conversion failed, passing to docling")
+            
+            # .doc → Confluence MIME HTML или бинарный .doc
+            if ext == ".doc":
+                if is_confluence_doc(fbytes):
+                    # Confluence export: MIME-encoded HTML → декодируем → подменяем на .html
+                    print(f"Confluence .doc detected: {fname}")
+                    html_bytes, html_name = decode_confluence_doc(fbytes, fname)
+                    if html_bytes:
+                        files[fi] = ("files", (html_name, html_bytes, "text/html"))
+                        print(f"Confluence decode OK: {fname} -> {html_name} ({len(html_bytes)} bytes)")
+                    else:
+                        print(f"Confluence decode FAILED: {fname} -> returning error")
+                        _total_ms = (time.time() - _t_total) * 1000
+                        error_msg = (
+                            f"Не удалось извлечь HTML из файла «{fname}» (Confluence export). "
+                            f"Попробуйте экспортировать документ из Confluence в формате PDF. "
+                            f"Если возникнут вопросы — оставьте заявку: {SUPPORT_PORTAL_URL}"
+                        )
+                        return Response(
+                            content=json.dumps({"detail": error_msg}, ensure_ascii=False).encode(),
+                            status_code=422,
+                            headers={"content-type": "application/json"},
+                        )
+                else:
+                    # Бинарный .doc → Gotenberg → PDF → PyMuPDF → markdown
+                    print(f"Binary .doc detected: {fname} -> converting via Gotenberg+PyMuPDF")
+                    _t_doc = time.time()
+                    doc_result = await convert_doc_to_markdown(client, fbytes, fname)
+                    _doc_ms = (time.time() - _t_doc) * 1000
+                    if doc_result:
+                        print(f"TIMING doc_convert: {_doc_ms:.0f}ms")
+                        _total_ms = (time.time() - _t_total) * 1000
+                        print(f"TIMING total: {_total_ms:.0f}ms  status: 200 (doc)")
+                        return Response(content=doc_result, status_code=200, headers={"content-type": "application/json"})
+                    else:
+                        print(f"DOC conversion failed, passing to docling")
 
         # ── Определяем pipeline (auto / vlm / standard) ──
         pipeline_value = None
@@ -449,7 +664,20 @@ async def proxy(request: Request, path: str):
                     _pdf_doc.close()
                 except Exception as e:
                     print(f"WARNING: could not count pages: {e}")
+                # Подсчёт картинок для предупреждения
+                _image_count = count_pdf_images(fbytes) if not _is_scan else 0
+                if _image_count > 0:
+                    print(f"PDF images: {_image_count} images in {_page_count} pages")
+                
                 pdf_type = "SCAN" if _is_scan else "TEXT PDF"
+                _base_fname = fname.rsplit("/", 1)[-1] if "/" in fname else fname
+                # Убираем UUID-префикс из имени файла для пользователя
+                if "_" in _base_fname and len(_base_fname.split("_")[0]) == 36:
+                    _base_fname = _base_fname.split("_", 1)[1]
+                _processing_warning = get_processing_warning(_base_fname, _page_count, _image_count, _is_scan)
+                if _processing_warning:
+                    print(f"WARNING for user: {_processing_warning}")
+                
                 # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard
                 VLM_PAGE_LIMIT = 20
                 if _is_scan:
@@ -463,6 +691,7 @@ async def proxy(request: Request, path: str):
                     print(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm")
             else:
                 # Не PDF (docx, xlsx и т.д.)
+                _processing_warning = ""
                 file_names = [fname for _, (fname, _, _) in files]
                 
                 # Проверяем: есть ли OLE-объекты (MathType формулы)?
@@ -559,8 +788,24 @@ async def proxy(request: Request, path: str):
         _total_ms = (time.time() - _t_total) * 1000
         print(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
         
+        # Инъекция предупреждения о большом документе
+        _resp_content = resp.content
+        if resp.status_code == 200 and '_processing_warning' in dir() and _processing_warning:
+            try:
+                _resp_data = json.loads(_resp_content)
+                _doc = _resp_data.get("document", {})
+                _md = _doc.get("md_content", "")
+                if _md:
+                    _warning_block = f"> ⚠️ {_processing_warning}\n\n"
+                    _doc["md_content"] = _warning_block + _md
+                    _resp_data["document"] = _doc
+                    _resp_content = json.dumps(_resp_data, ensure_ascii=False).encode()
+                    print(f"Injected processing warning into response")
+            except Exception as e:
+                print(f"Warning injection error: {e}")
+        
         # Пост-обработка: KaTeX-совместимость
-        fixed_content = fix_katex_compatibility(resp.content) if resp.status_code == 200 else resp.content
+        fixed_content = fix_katex_compatibility(_resp_content) if resp.status_code == 200 else _resp_content
         
         # Убираем Content-Length — он мог измениться после KaTeX fix
         resp_headers = dict(resp.headers)
