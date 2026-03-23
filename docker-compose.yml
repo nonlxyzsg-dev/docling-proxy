@@ -1,0 +1,9 @@
+services:
+  docling-proxy:
+    build: .
+    container_name: docling-proxy
+    restart: unless-stopped
+    ports:
+      - "10.121.3.201:5005:5003"
+    environment:
+      - DOCLING_URL=${DOCLING_URL}

@@ -1,0 +1,11 @@
+.env
+wheels/
+*.bak
+*.bak.*
+*.bak2
+*.bak3
+__pycache__/
+*.pyc
+=
+naming
+resolving
