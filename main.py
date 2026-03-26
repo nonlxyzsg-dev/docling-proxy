@@ -730,6 +730,12 @@ async def proxy(request: Request, path: str):
         data = [(k, v) for k, v in data if k != "pipeline"]
         data.append(("pipeline", pipeline_value))
 
+        # ── Standard pipeline: отключаем OCR (Qwen3.5 VLM вместо PaddleOCR) ──
+        if pipeline_value == "standard":
+            data = [(k, v) for k, v in data if k != "do_ocr"]
+            data.append(("do_ocr", "false"))
+            print("Standard Pipeline: OCR disabled, images via Qwen3.5 VLM")
+
         # ── VLM Pipeline: страница целиком -> Qwen3-VL -> markdown ──
         if pipeline_value == "vlm":
             
