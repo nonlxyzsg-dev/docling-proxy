@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, Response
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from datetime import datetime as dt
-import os, json, httpx, asyncio, zipfile
+import os, json, httpx, asyncio, zipfile, uuid, base64, re, glob
 import xml.etree.ElementTree as ET
 
 load_dotenv()
@@ -24,6 +24,16 @@ DEFAULT_VLM_TIMEOUT = os.getenv("DEFAULT_VLM_TIMEOUT")
 DEFAULT_VLM_CONCURRENCY = os.getenv("DEFAULT_VLM_CONCURRENCY")
 DEFAULT_VLM_MAX_CONCURRENT_DOCS = os.getenv("DEFAULT_VLM_MAX_CONCURRENT_DOCS")
 DEFAULT_VLM_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_VLM_MAX_COMPLETION_TOKENS", "2048"))
+
+# ── OCR SDK интеграция (v4.0) ──
+OCR_SDK_URL = os.getenv("OCR_SDK_URL", "http://10.121.3.201:9996")
+OCR_SDK_INBOX_CONTAINER = os.getenv("OCR_SDK_INBOX_CONTAINER", "/inbox")
+OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
+OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
+ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower() == "true"
+OCR_SDK_DPI = 200  # Must match pipeline.page_loader.pdf_dpi in OCR SDK config.yaml
+
+ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
 DEFAULT_VLM_PROMPT = (
     "Проанализируй это изображение из документа. Выполни ОБА шага:\n\n"
@@ -61,8 +71,38 @@ DEFAULT_VLM_PIPELINE_PROMPT = (
 
 
 # ═══════════════════════════════════════════════════════════════
-# httpx AsyncClient
+# httpx AsyncClient + inbox cleanup
 # ═══════════════════════════════════════════════════════════════
+
+def cleanup_old_inbox_files(max_age_seconds: int = 3600):
+    """Delete files older than max_age_seconds from shared inbox. Safety net for leaked files."""
+    inbox = OCR_SDK_INBOX_CONTAINER
+    if not os.path.isdir(inbox):
+        return
+    now = time.time()
+    count = 0
+    for f in os.listdir(inbox):
+        fp = os.path.join(inbox, f)
+        try:
+            if os.path.isfile(fp) and (now - os.path.getmtime(fp)) > max_age_seconds:
+                os.remove(fp)
+                count += 1
+        except Exception:
+            pass
+    if count > 0:
+        print(f"[inbox cleanup] Removed {count} stale file(s) from {inbox}")
+
+
+async def _periodic_inbox_cleanup():
+    """Background task: clean inbox every 30 minutes."""
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            cleanup_old_inbox_files()
+        except Exception as e:
+            print(f"[inbox cleanup] Error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(
@@ -70,7 +110,10 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         follow_redirects=False,
     )
+    cleanup_old_inbox_files()
+    cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
     yield
+    cleanup_task.cancel()
     await app.state.client.aclose()
 
 app = FastAPI(lifespan=lifespan)
@@ -258,9 +301,13 @@ def get_processing_warning(filename: str, page_count: int, image_count: int, is_
     # Оценка времени обработки
     est_seconds = 0
     if is_scan:
-        # Скан: каждая страница → VLM запрос, параллельно по vlm_concurrency
-        batches = math.ceil(page_count / vlm_concurrency)
-        est_seconds = batches * 20
+        if OCR_SDK_ENABLED:
+            # SDK: ~0.5 сек/стр + enrichment
+            est_seconds = page_count * 0.5 + 10
+        else:
+            # VLM: каждая страница → VLM запрос, параллельно по vlm_concurrency
+            batches = math.ceil(page_count / vlm_concurrency)
+            est_seconds = batches * 20
     else:
         # TEXT PDF > 20 стр. → standard pipeline
         est_seconds = page_count * 0.2  # нативное извлечение текста
@@ -333,8 +380,8 @@ def build_custom_model(vlm_overrides: dict = {}, classification: str = "false") 
         "picture_area_threshold": 0.01,
         "generation_config": {"max_new_tokens": 2048, "do_sample": False}
     }
-    
-	# Если включена классификация, добавляем соответствующие параметры в конфиг
+
+    # Если включена классификация, добавляем соответствующие параметры в конфиг
     if classification == "true":
         api_config["classification_min_confidence"] = 0.8
         api_config["classification_deny"] = ['icon', 'logo', 'signature', 'stamp', 'qr_code', 'bar_code']
@@ -369,8 +416,6 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
 # Пост-обработка LaTeX для KaTeX-совместимости
 # ═══════════════════════════════════════════════════════════════
 
-import re
-
 def fix_katex_compatibility(response_bytes: bytes) -> bytes:
     """Fix LaTeX in docling response for KaTeX rendering in OpenWebUI."""
     try:
@@ -390,8 +435,11 @@ def fix_katex_compatibility(response_bytes: bytes) -> bytes:
         if len(parts) % 2 == 0:  # нечётное количество $$ = незакрытый блок
             md = md + "\n$$"
 
+        # Fix HTML entities from VLM output (таблицы с &amp; вместо &)
+        md = md.replace("&amp;", "&")
+        md = md.replace("&lt;", "<")
+        md = md.replace("&gt;", ">")
 
-        
         if len(md) != original_len:
             print(f"KaTeX fix: {original_len} -> {len(md)} chars")
         
@@ -528,6 +576,217 @@ async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, 
         print(f"DOC conversion error: {e}")
         return None
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# OCR SDK — обработка SCAN PDF (v4.0)
+# ═══════════════════════════════════════════════════════════════
+
+async def enrich_image_regions(
+    client: httpx.AsyncClient, markdown: str, json_result: list,
+    pdf_bytes: bytes, vlm_overrides: dict
+) -> str:
+    """Find image-type regions in SDK output and describe them via 122B VLM."""
+    regions_to_enrich = []
+    for page_idx, page_regions in enumerate(json_result):
+        if not isinstance(page_regions, list):
+            continue
+        for region in page_regions:
+            label = region.get("label", "")
+            if label in ENRICH_LABELS and region.get("content") is None:
+                bbox = region.get("bbox_2d")
+                if bbox and len(bbox) == 4:
+                    regions_to_enrich.append({"page": page_idx, "bbox": bbox, "label": label})
+
+    if not regions_to_enrich:
+        print("OCR SDK enrichment: no image regions found")
+        return markdown
+
+    print(f"OCR SDK enrichment: {len(regions_to_enrich)} region(s) to describe via 122B")
+
+    vlm_url = vlm_overrides.get("vlm_url", DEFAULT_VLM_URL)
+    vlm_api_key = vlm_overrides.get("vlm_api_key", DEFAULT_VLM_API_KEY)
+    vlm_model = vlm_overrides.get("vlm_model", DEFAULT_VLM_MODEL)
+    vlm_timeout = int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT))
+    vlm_concurrency = int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY))
+    prompt = vlm_overrides.get("vlm_prompt", DEFAULT_VLM_PROMPT)
+
+    sem = asyncio.Semaphore(vlm_concurrency)
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    scale = OCR_SDK_DPI / 72.0
+    render_scale = 3.0
+
+    tasks = []
+    placeholder_map = {}
+
+    for i, region in enumerate(regions_to_enrich):
+        page_idx = region["page"]
+        x1, y1, x2, y2 = region["bbox"]
+        if page_idx >= len(doc):
+            print(f"OCR SDK enrichment: page {page_idx} out of range, skipping")
+            continue
+        clip_rect = fitz.Rect(x1 / scale, y1 / scale, x2 / scale, y2 / scale)
+        mat = fitz.Matrix(render_scale, render_scale)
+        try:
+            pix = doc[page_idx].get_pixmap(matrix=mat, clip=clip_rect)
+            png_bytes_region = pix.tobytes("png")
+        except Exception as e:
+            print(f"OCR SDK enrichment: render failed page={page_idx} bbox={region['bbox']}: {e}")
+            continue
+        placeholder = f"![](page={page_idx},bbox=[{x1}, {y1}, {x2}, {y2}])"
+        placeholder_map[i] = placeholder
+        tasks.append(_describe_single_region(
+            client, png_bytes_region, sem,
+            vlm_url, vlm_api_key, vlm_model, vlm_timeout, prompt
+        ))
+
+    doc.close()
+
+    if not tasks:
+        return markdown
+
+    _t = time.time()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    _elapsed = (time.time() - _t) * 1000
+
+    matched = 0
+    for i, result in enumerate(results):
+        if i not in placeholder_map:
+            continue
+        placeholder = placeholder_map[i]
+        if isinstance(result, Exception):
+            print(f"OCR SDK enrichment: VLM error for region {i}: {result}")
+            description = f"[Ошибка описания: {type(result).__name__}]"
+        else:
+            description = result
+        if placeholder in markdown:
+            markdown = markdown.replace(placeholder, description, 1)
+            matched += 1
+        else:
+            bbox = regions_to_enrich[i]["bbox"]
+            page = regions_to_enrich[i]["page"]
+            pattern = re.compile(
+                r'!\[\]\(page=' + str(page) + r',\s*bbox=\[\s*' +
+                str(bbox[0]) + r'\s*,\s*' + str(bbox[1]) + r'\s*,\s*' +
+                str(bbox[2]) + r'\s*,\s*' + str(bbox[3]) + r'\s*\]\)'
+            )
+            new_md, count = pattern.subn(description, markdown, count=1)
+            if count > 0:
+                markdown = new_md
+                matched += 1
+            else:
+                print(f"OCR SDK enrichment: placeholder not found for page={page} bbox={bbox}")
+                markdown += f"\n\n{description}\n"
+                matched += 1
+
+    print(f"OCR SDK enrichment: {matched}/{len(tasks)} descriptions inserted, {_elapsed:.0f}ms")
+    return markdown
+
+
+async def _describe_single_region(
+    client: httpx.AsyncClient, png_bytes: bytes, sem: asyncio.Semaphore,
+    vlm_url: str, vlm_api_key: str, vlm_model: str, vlm_timeout: int, prompt: str
+) -> str:
+    """Send a single image region to 122B VLM and get text description."""
+    b64 = base64.b64encode(png_bytes).decode()
+    body = {
+        "model": vlm_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text", "text": prompt + "\n/no_think"}
+                ]
+            }
+        ],
+        "max_tokens": 2048,
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {vlm_api_key}"
+    }
+    async with sem:
+        resp = await client.post(vlm_url, json=body, headers=headers, timeout=float(vlm_timeout))
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return content or "[Описание недоступно]"
+
+
+async def convert_scan_via_ocr_sdk(
+    client: httpx.AsyncClient, pdf_bytes: bytes, filename: str, vlm_overrides: dict
+) -> bytes:
+    """Process SCAN PDF via OCR SDK + optional enrichment via 122B.
+
+    Returns docling-compatible JSON bytes, or None on failure (triggers fallback).
+    """
+    file_id = str(uuid.uuid4())
+    inbox_path = os.path.join(OCR_SDK_INBOX_CONTAINER, f"{file_id}.pdf")
+    _t_start = time.time()
+    try:
+        with open(inbox_path, "wb") as f:
+            f.write(pdf_bytes)
+        print(f"OCR SDK: wrote {len(pdf_bytes)} bytes to {inbox_path}")
+
+        sdk_payload = {"images": [f"{OCR_SDK_INBOX_CONTAINER}/{file_id}.pdf"]}
+        _t_sdk = time.time()
+        sdk_resp = await client.post(
+            f"{OCR_SDK_URL}/glmocr/parse",
+            json=sdk_payload,
+            timeout=float(OCR_SDK_TIMEOUT)
+        )
+        _sdk_ms = (time.time() - _t_sdk) * 1000
+
+        if sdk_resp.status_code != 200:
+            print(f"OCR SDK: HTTP {sdk_resp.status_code} after {_sdk_ms:.0f}ms")
+            return None
+
+        sdk_data = sdk_resp.json()
+        markdown = sdk_data.get("markdown_result", "")
+        json_result = sdk_data.get("json_result", [])
+
+        if not markdown:
+            print(f"OCR SDK: empty markdown_result after {_sdk_ms:.0f}ms")
+            return None
+
+        print(f"OCR SDK: {len(markdown)} chars markdown, {len(json_result)} pages, {_sdk_ms:.0f}ms")
+
+        if ENRICH_PICTURES_WITH_122B and json_result:
+            try:
+                _t_enrich = time.time()
+                markdown = await enrich_image_regions(
+                    client, markdown, json_result, pdf_bytes, vlm_overrides
+                )
+                _enrich_ms = (time.time() - _t_enrich) * 1000
+                print(f"OCR SDK enrichment: {_enrich_ms:.0f}ms")
+            except Exception as e:
+                print(f"OCR SDK enrichment ERROR (non-fatal): {e}")
+
+        _total_ms = (time.time() - _t_start) * 1000
+        response = {
+            "document": {"filename": filename, "md_content": markdown},
+            "status": "success",
+            "errors": [],
+            "processing_time": _total_ms / 1000,
+        }
+        print(f"TIMING ocr_sdk total: {_total_ms:.0f}ms")
+        return json.dumps(response, ensure_ascii=False).encode()
+
+    except Exception as e:
+        _total_ms = (time.time() - _t_start) * 1000
+        print(f"OCR SDK ERROR after {_total_ms:.0f}ms: {e}")
+        return None
+
+    finally:
+        try:
+            if os.path.exists(inbox_path):
+                os.remove(inbox_path)
+                print(f"OCR SDK: cleaned up {inbox_path}")
+        except Exception as e:
+            print(f"OCR SDK: cleanup failed {inbox_path}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -679,6 +938,22 @@ async def proxy(request: Request, path: str):
                 if _processing_warning:
                     print(f"WARNING for user: {_processing_warning}")
                 
+                # ── SCAN PDF + OCR SDK ENABLED → новый путь v4.0 ──
+                if _is_scan and OCR_SDK_ENABLED:
+                    print(f"Auto-detect: {fname} -> SCAN ({_page_count} pages) -> OCR SDK path (v4.0)")
+                    sdk_result = await convert_scan_via_ocr_sdk(client, fbytes, fname, vlm_overrides)
+                    if sdk_result is not None:
+                        fixed_result = fix_katex_compatibility(sdk_result)
+                        _total_ms = (time.time() - _t_total) * 1000
+                        print(f"TIMING total: {_total_ms:.0f}ms  status: 200 (ocr-sdk)")
+                        return Response(
+                            content=fixed_result,
+                            status_code=200,
+                            headers={"content-type": "application/json"},
+                        )
+                    else:
+                        print("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
+
                 # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard
                 VLM_PAGE_LIMIT = 20
                 if _is_scan:
@@ -770,7 +1045,7 @@ async def proxy(request: Request, path: str):
                 data.append(("picture_description_api", api_json))
                 print(f"Режим: picture_description_api (concurrency={_conc})")
 
-		# Сохранение параметров для отладки
+        # Сохранение параметров для отладки
         save(data, files)
 
         max_docs = int(vlm_overrides.get(
