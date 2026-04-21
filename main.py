@@ -46,6 +46,33 @@ DEFAULT_VLM_PROMPT = (
     "Отвечай на русском. Будь точным — не пропускай информацию и не выдумывай."
 )
 
+# Промпт для описания отдельных регионов (OCR SDK enrichment).
+# Отличается от DEFAULT_VLM_PROMPT тем, что допускает лаконичные ответы на
+# типовые случаи (подпись/штамп/пусто) и прямо запрещает достраивать
+# обрезанный текст — защита от галлюцинаций на неточных кропах.
+ENRICH_VLM_PROMPT = (
+    "Опиши кратко, что изображено на этом фрагменте документа. Фрагмент мог быть "
+    "вырезан неточно и содержать только часть элемента, пустое поле или фоновый шум.\n\n"
+    "ПРАВИЛА:\n"
+    "• Рукописная подпись или росчерк — ответь: «Рукописная подпись».\n"
+    "• Штамп или печать — прочитай видимый текст штампа; если читаемого текста нет — "
+    "«Штамп без читаемого текста».\n"
+    "• Логотип — назови организацию, если узнаёшь её по начертанию; иначе «Логотип».\n"
+    "• График, диаграмма, схема, чертёж — опиши максимально подробно: "
+    "тип, оси и единицы измерения, легенду, заголовок, ключевые числовые значения, "
+    "штамп чертежа (организация, номер, дата, подписи), спецификацию, "
+    "позиции деталей, размеры, допуски, соединения, сечения, виды.\n"
+    "• Фотография или иллюстрация — опиши сюжет и ключевые объекты.\n"
+    "• Пустое поле, фон, декоративная линия, рамка, штрихкод без читаемых цифр, "
+    "одиночный росчерк без контекста — ответь одним словом: «Пусто».\n\n"
+    "ЗАПРЕТЫ:\n"
+    "• НЕ достраивай обрезанные слова. Если видишь фрагмент текста — "
+    "приведи ровно то что видно, в кавычках, без предположений о полном слове.\n"
+    "• НЕ описывай декоративные элементы (линии, маркеры, отступы, пустое место).\n"
+    "• НЕ добавляй вступлений вида «На изображении видно...».\n\n"
+    "Отвечай на русском, строго по факту."
+)
+
 DEFAULT_VLM_PIPELINE_PROMPT = (
     "Обработай эту страницу документа и верни результат в формате markdown.\n\n"
     "ПРАВИЛА ИЗВЛЕЧЕНИЯ ТЕКСТА:\n"
@@ -581,6 +608,59 @@ async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, 
 # OCR SDK — обработка SCAN PDF (v4.0)
 # ═══════════════════════════════════════════════════════════════
 
+def calculate_enrich_max_tokens(label: str, bbox: list) -> int:
+    """Динамический max_tokens для обогащения регионов OCR SDK.
+
+    База по label × множитель площади × множитель формы.
+    bbox — нормализованные координаты OCR SDK (0..1000 по каждой оси),
+    norm_area соответственно лежит в диапазоне 0..1_000_000.
+
+    Логика:
+    - Штампы/печати фактически короткие (пара предложений максимум).
+    - Обычные картинки (подписи, логотипы, мелкие фото) обычно короткие.
+    - Графикам нужен запас под оси, легенду, ключевые значения.
+    - Инженерным чертежам законно нужно 3K+ под штамп, размеры,
+      спецификации, позиции, сечения.
+    - Крошечные или сильно вытянутые регионы обычно декоративные
+      или ошибочно классифицированные — снижаем cap, чтобы VLM не
+      ушла в описательный loop.
+
+    Пороги — начальные прикидки, после выката калибруются на реальных
+    документах (книги, CAD-чертежи, документы со штампами).
+    """
+    x1, y1, x2, y2 = bbox
+    w, h = (x2 - x1), (y2 - y1)
+    norm_area = w * h
+
+    base_by_label = {
+        "seal":                 256,
+        "stamp":                256,
+        "image":                768,
+        "chart":                1536,
+        "engineering_drawing":  3072,
+        "cad_drawing":          3072,
+        "electrical_diagram":   3072,
+    }
+    base = base_by_label.get(label, 768)
+
+    # Множитель площади: кропы <1% страницы обычно декоративные/мисклассы
+    if norm_area < 10_000:
+        area_mult = 0.4
+    elif norm_area < 100_000:
+        area_mult = 0.7
+    else:
+        area_mult = 1.0
+
+    # Множитель формы: сильно вытянутые регионы обычно рамки,
+    # штрихкоды, декоративные линии, а не контент
+    aspect = max(w, h) / max(min(w, h), 1)
+    shape_mult = 0.5 if aspect > 5 else 1.0
+
+    result = int(base * area_mult * shape_mult)
+    # Пол: модель должна хотя бы успеть сказать «Пусто»
+    return max(result, 128)
+
+
 async def enrich_image_regions(
     client: httpx.AsyncClient, markdown: str, json_result: list,
     pdf_bytes: bytes, vlm_overrides: dict
@@ -608,7 +688,7 @@ async def enrich_image_regions(
     vlm_model = vlm_overrides.get("vlm_model", DEFAULT_VLM_MODEL)
     vlm_timeout = int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT))
     vlm_concurrency = int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY))
-    prompt = vlm_overrides.get("vlm_prompt", DEFAULT_VLM_PROMPT)
+    prompt = vlm_overrides.get("vlm_prompt", ENRICH_VLM_PROMPT)
 
     sem = asyncio.Semaphore(vlm_concurrency)
 
@@ -644,9 +724,19 @@ async def enrich_image_regions(
             continue
         placeholder = f"![](page={page_idx},bbox=[{x1}, {y1}, {x2}, {y2}])"
         placeholder_map[i] = placeholder
+        max_tok = calculate_enrich_max_tokens(region["label"], region["bbox"])
+        # Наблюдаемость: по логам калибруем пороги после выката.
+        bw, bh = (x2 - x1), (y2 - y1)
+        aspect = max(bw, bh) / max(min(bw, bh), 1)
+        print(
+            f"OCR SDK enrichment: region p{page_idx} label={region['label']} "
+            f"bbox={region['bbox']} norm_area={bw * bh} aspect={aspect:.1f} "
+            f"max_tokens={max_tok}"
+        )
         tasks.append(_describe_single_region(
             client, png_bytes_region, sem,
-            vlm_url, vlm_api_key, vlm_model, vlm_timeout, prompt
+            vlm_url, vlm_api_key, vlm_model, vlm_timeout, prompt,
+            max_tokens=max_tok,
         ))
 
     doc.close()
@@ -694,7 +784,8 @@ async def enrich_image_regions(
 
 async def _describe_single_region(
     client: httpx.AsyncClient, png_bytes: bytes, sem: asyncio.Semaphore,
-    vlm_url: str, vlm_api_key: str, vlm_model: str, vlm_timeout: int, prompt: str
+    vlm_url: str, vlm_api_key: str, vlm_model: str, vlm_timeout: int, prompt: str,
+    max_tokens: int = 768,
 ) -> str:
     """Send a single image region to 122B VLM and get text description."""
     b64 = base64.b64encode(png_bytes).decode()
@@ -709,7 +800,7 @@ async def _describe_single_region(
                 ]
             }
         ],
-        "max_tokens": 2048,
+        "max_tokens": max_tokens,
         "chat_template_kwargs": {"enable_thinking": False}
     }
     headers = {
