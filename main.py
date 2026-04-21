@@ -31,7 +31,6 @@ OCR_SDK_INBOX_CONTAINER = os.getenv("OCR_SDK_INBOX_CONTAINER", "/inbox")
 OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
 OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
 ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower() == "true"
-OCR_SDK_DPI = 200  # Must match pipeline.page_loader.pdf_dpi in OCR SDK config.yaml
 
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
@@ -614,7 +613,6 @@ async def enrich_image_regions(
     sem = asyncio.Semaphore(vlm_concurrency)
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    scale = OCR_SDK_DPI / 72.0
     render_scale = 3.0
 
     tasks = []
@@ -626,10 +624,20 @@ async def enrich_image_regions(
         if page_idx >= len(doc):
             print(f"OCR SDK enrichment: page {page_idx} out of range, skipping")
             continue
-        clip_rect = fitz.Rect(x1 / scale, y1 / scale, x2 / scale, y2 / scale)
+        # OCR SDK отдаёт bbox_2d в нормализованных координатах 0-1000 по каждой оси
+        # (x/image_width*1000, y/image_height*1000).
+        # Обратно в пункты PDF переводим через реальные размеры страницы.
+        page = doc[page_idx]
+        pw, ph = page.rect.width, page.rect.height
+        clip_rect = fitz.Rect(
+            x1 / 1000.0 * pw,
+            y1 / 1000.0 * ph,
+            x2 / 1000.0 * pw,
+            y2 / 1000.0 * ph,
+        )
         mat = fitz.Matrix(render_scale, render_scale)
         try:
-            pix = doc[page_idx].get_pixmap(matrix=mat, clip=clip_rect)
+            pix = page.get_pixmap(matrix=mat, clip=clip_rect)
             png_bytes_region = pix.tobytes("png")
         except Exception as e:
             print(f"OCR SDK enrichment: render failed page={page_idx} bbox={region['bbox']}: {e}")
