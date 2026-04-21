@@ -7,3 +7,10 @@ services:
       - "10.121.3.201:5005:5003"
     environment:
       - DOCLING_URL=${DOCLING_URL}
+      - OCR_SDK_URL=${OCR_SDK_URL}
+      - OCR_SDK_INBOX_HOST=${OCR_SDK_INBOX_HOST}
+      - OCR_SDK_INBOX_CONTAINER=${OCR_SDK_INBOX_CONTAINER}
+      - ENRICH_PICTURES_WITH_122B=${ENRICH_PICTURES_WITH_122B}
+      - OCR_SDK_ENABLED=${OCR_SDK_ENABLED}
+    volumes:
+      - /docker-shared/ocr-inbox:/inbox
