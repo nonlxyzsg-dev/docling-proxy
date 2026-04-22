@@ -77,6 +77,15 @@ OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
 OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
 ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower() == "true"
 
+# ── PostgreSQL-статистика (fire-and-forget, не влияет на latency) ──
+# При STATS_ENABLED=false весь блок выключен: очередь/пул/worker не создаются,
+# накладных расходов ноль (см. README-STATS.md).
+STATS_ENABLED = os.getenv("STATS_ENABLED", "false").lower() == "true"
+STATS_DB_DSN = os.getenv("STATS_DB_DSN", "")
+STATS_QUEUE_SIZE = int(os.getenv("STATS_QUEUE_SIZE", "10000"))
+STATS_BATCH_SIZE = int(os.getenv("STATS_BATCH_SIZE", "50"))
+STATS_FLUSH_INTERVAL_SEC = float(os.getenv("STATS_FLUSH_INTERVAL_SEC", "5"))
+
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
 DEFAULT_VLM_PROMPT = (
@@ -174,6 +183,164 @@ async def _periodic_inbox_cleanup():
             logger.error(f"[inbox cleanup] Error: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Статистика запросов в PostgreSQL (опциональная, fire-and-forget)
+# ═══════════════════════════════════════════════════════════════
+# Вся подсистема активна только при STATS_ENABLED=true и доступном
+# PostgreSQL. Любая запись в БД — из фоновой корутины батчами. В
+# горячем пути запроса блокирующих вызовов нет, при переполнении
+# очереди события отбрасываются с warning. Ошибка записи никогда
+# не вызывает HTTP-ошибку у клиента. Подробнее — README-STATS.md.
+
+_STATS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS docling_requests (
+    id                      BIGSERIAL PRIMARY KEY,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    request_id              UUID,
+    filename                TEXT,
+    file_size_bytes         BIGINT,
+    file_pages              INTEGER,
+    doc_type                TEXT,
+    pipeline                TEXT,
+    http_status             INTEGER,
+    duration_total_ms       INTEGER,
+    duration_docling_ms     INTEGER,
+    duration_queue_wait_ms  INTEGER,
+    timings_json            JSONB,
+    error_message           TEXT,
+    client_ip               TEXT,
+    user_agent              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_docling_requests_created_at  ON docling_requests (created_at);
+CREATE INDEX IF NOT EXISTS idx_docling_requests_doc_type    ON docling_requests (doc_type);
+CREATE INDEX IF NOT EXISTS idx_docling_requests_pipeline    ON docling_requests (pipeline);
+CREATE INDEX IF NOT EXISTS idx_docling_requests_http_status ON docling_requests (http_status);
+"""
+
+
+async def _stats_init_conn(conn):
+    """Codec для JSONB — чтобы в executemany передавать dict напрямую."""
+    await conn.set_type_codec(
+        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+    )
+
+
+async def _stats_ensure_schema(pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(_STATS_SCHEMA_SQL)
+
+
+async def _stats_insert_batch(pool, rows: list) -> None:
+    query = """
+        INSERT INTO docling_requests (
+            created_at, request_id, filename, file_size_bytes, file_pages,
+            doc_type, pipeline, http_status, duration_total_ms,
+            duration_docling_ms, duration_queue_wait_ms, timings_json,
+            error_message, client_ip, user_agent
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    """
+    args = [
+        (
+            r.get("created_at"),
+            r.get("request_id"),
+            r.get("filename"),
+            r.get("file_size_bytes"),
+            r.get("file_pages"),
+            r.get("doc_type"),
+            r.get("pipeline"),
+            r.get("http_status"),
+            r.get("duration_total_ms"),
+            r.get("duration_docling_ms"),
+            r.get("duration_queue_wait_ms"),
+            r.get("timings_json"),
+            r.get("error_message"),
+            r.get("client_ip"),
+            r.get("user_agent"),
+        )
+        for r in rows
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(query, args)
+
+
+async def _stats_worker(app: FastAPI) -> None:
+    """Корутина-воркер: вытаскивает записи из очереди и пишет пачками.
+
+    Трижды корректная: на полный батч, по таймауту flush и при ошибке БД
+    — всегда чистит batch и сдвигает last_flush, чтобы не крутиться в
+    бесконечном re-try над одними и теми же записями.
+    """
+    pool = app.state.stats_pool
+    queue: asyncio.Queue = app.state.stats_queue
+    metrics = app.state.stats_metrics
+    batch: list = []
+    last_flush = time.time()
+    while True:
+        remaining = STATS_FLUSH_INTERVAL_SEC - (time.time() - last_flush)
+        try:
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            item = await asyncio.wait_for(queue.get(), timeout=remaining)
+            batch.append(item)
+            queue.task_done()
+        except asyncio.TimeoutError:
+            pass
+        should_flush = batch and (
+            len(batch) >= STATS_BATCH_SIZE
+            or (time.time() - last_flush) >= STATS_FLUSH_INTERVAL_SEC
+        )
+        if should_flush:
+            try:
+                await _stats_insert_batch(pool, batch)
+                metrics["written"] += len(batch)
+            except Exception as e:
+                metrics["db_errors"] += 1
+                logger.warning(
+                    f"Stats: batch insert failed ({e}); dropping {len(batch)} records"
+                )
+            batch = []
+            last_flush = time.time()
+
+
+async def _stats_metrics_loop(app: FastAPI) -> None:
+    while True:
+        await asyncio.sleep(60)
+        m = app.state.stats_metrics
+        q: asyncio.Queue = app.state.stats_queue
+        logger.info(
+            f"Stats: enqueued={m['enqueued']}, written={m['written']}, "
+            f"dropped={m['dropped']}, db_errors={m['db_errors']}, "
+            f"queue_size={q.qsize()}"
+        )
+
+
+def _stats_enqueue(app: FastAPI, record: dict) -> None:
+    """Non-blocking enqueue. Полная очередь → drop + warning (не часто)."""
+    if not STATS_ENABLED or getattr(app.state, "stats_queue", None) is None:
+        return
+    m = app.state.stats_metrics
+    try:
+        app.state.stats_queue.put_nowait(record)
+        m["enqueued"] += 1
+    except asyncio.QueueFull:
+        m["dropped"] += 1
+        if m["dropped"] == 1 or m["dropped"] % 100 == 0:
+            logger.warning(
+                f"Stats: queue full, dropping record (total dropped={m['dropped']})"
+            )
+
+
+def _stats_set(request: Request, **fields) -> None:
+    """Положить метки в stats-контекст текущего запроса. Безопасно при OFF."""
+    state = getattr(request, "state", None)
+    bag = getattr(state, "stats", None) if state is not None else None
+    if bag is None:
+        return
+    for k, v in fields.items():
+        if v is not None:
+            bag[k] = v
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(
@@ -183,11 +350,98 @@ async def lifespan(app: FastAPI):
     )
     cleanup_old_inbox_files()
     cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
+
+    # ── Статистика ──
+    app.state.stats_pool = None
+    app.state.stats_queue = None
+    app.state.stats_worker_task = None
+    app.state.stats_metrics_task = None
+    app.state.stats_metrics = {"enqueued": 0, "written": 0, "dropped": 0, "db_errors": 0}
+
+    if STATS_ENABLED:
+        try:
+            import asyncpg  # ленивый импорт: без STATS_ENABLED не требуется
+            if not STATS_DB_DSN:
+                raise RuntimeError("STATS_DB_DSN is empty")
+            app.state.stats_pool = await asyncpg.create_pool(
+                dsn=STATS_DB_DSN, min_size=1, max_size=5, init=_stats_init_conn
+            )
+            await _stats_ensure_schema(app.state.stats_pool)
+            app.state.stats_queue = asyncio.Queue(maxsize=STATS_QUEUE_SIZE)
+            app.state.stats_worker_task = asyncio.create_task(_stats_worker(app))
+            app.state.stats_metrics_task = asyncio.create_task(_stats_metrics_loop(app))
+            logger.info(
+                f"Stats collection enabled (queue={STATS_QUEUE_SIZE}, "
+                f"batch={STATS_BATCH_SIZE}, flush={STATS_FLUSH_INTERVAL_SEC}s)"
+            )
+        except Exception as e:
+            logger.error(f"Stats: init failed ({e}); continuing with stats disabled")
+            app.state.stats_pool = None
+            app.state.stats_queue = None
+    else:
+        logger.info("Stats collection disabled (STATS_ENABLED=false)")
+
     yield
+
     cleanup_task.cancel()
+
+    # Graceful shutdown stats: дать воркеру добить очередь в пределах 10с.
+    if app.state.stats_queue is not None:
+        try:
+            await asyncio.wait_for(app.state.stats_queue.join(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Stats: queue drain timed out; "
+                f"{app.state.stats_queue.qsize()} records lost"
+            )
+    for t in (app.state.stats_worker_task, app.state.stats_metrics_task):
+        if t is not None:
+            t.cancel()
+    if app.state.stats_pool is not None:
+        try:
+            await app.state.stats_pool.close()
+        except Exception as e:
+            logger.warning(f"Stats: pool close error: {e}")
+
     await app.state.client.aclose()
 
 app = FastAPI(lifespan=lifespan)
+
+
+# Middleware: ровно одна точка enqueue на запрос. Handler по пути
+# дополняет request.state.stats через _stats_set(...).
+@app.middleware("http")
+async def _stats_middleware(request: Request, call_next):
+    if not STATS_ENABLED:
+        return await call_next(request)
+    # Инструментируем только основной multipart-эндпоинт конвертации.
+    is_convert_file = (
+        request.method == "POST"
+        and request.url.path.rstrip("/").endswith("/convert/file")
+    )
+    if not is_convert_file:
+        return await call_next(request)
+    from datetime import timezone
+    bag = {
+        "created_at": dt.now(timezone.utc),
+        "request_id": uuid.uuid4(),
+        "client_ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+    }
+    request.state.stats = bag
+    _t = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        bag["http_status"] = 500
+        bag["error_message"] = f"{type(e).__name__}: {e}"
+        bag["duration_total_ms"] = int((time.time() - _t) * 1000)
+        _stats_enqueue(request.app, bag)
+        raise
+    bag.setdefault("http_status", response.status_code)
+    bag.setdefault("duration_total_ms", int((time.time() - _t) * 1000))
+    _stats_enqueue(request.app, bag)
+    return response
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -973,9 +1227,13 @@ async def proxy(request: Request, path: str):
         # ── Проверка поддерживаемых форматов ──
         for fi, (_, (fname, fbytes, ftype)) in enumerate(files):
             ext = os.path.splitext(fname)[1].lower() if fname else ""
-            
+            # Базовая разметка запроса для статистики — срабатывает только
+            # если STATS_ENABLED=true (иначе request.state.stats отсутствует).
+            _stats_set(request, filename=fname, file_size_bytes=len(fbytes) if fbytes else None)
+
             # Неподдерживаемый формат → дружелюбное сообщение
             if ext and ext not in SUPPORTED_EXTENSIONS:
+                _stats_set(request, doc_type="UNSUPPORTED")
                 logger.warning(f"UNSUPPORTED FORMAT: {fname} ({ext})")
                 _total_ms = (time.time() - _t_total) * 1000
                 logger.info(f"TIMING total: {_total_ms:.0f}ms  status: unsupported_format")
@@ -988,6 +1246,7 @@ async def proxy(request: Request, path: str):
             
             # .xls → конвертируем через xlrd в markdown и возвращаем сразу
             if ext == ".xls":
+                _stats_set(request, doc_type="XLS", pipeline="xls_native")
                 logger.info(f"XLS detected: {fname} -> converting via xlrd/pandas")
                 _t_xls = time.time()
                 xls_result = convert_xls_to_markdown(fbytes, fname)
@@ -1005,6 +1264,7 @@ async def proxy(request: Request, path: str):
             if ext == ".doc":
                 if is_confluence_doc(fbytes):
                     # Confluence export: MIME-encoded HTML → декодируем → подменяем на .html
+                    _stats_set(request, doc_type="DOC_CONFLUENCE", pipeline="confluence_html")
                     logger.info(f"Confluence .doc detected: {fname}")
                     html_bytes, html_name = decode_confluence_doc(fbytes, fname)
                     if html_bytes:
@@ -1025,6 +1285,7 @@ async def proxy(request: Request, path: str):
                         )
                 else:
                     # Бинарный .doc → Gotenberg → PDF → PyMuPDF → markdown
+                    _stats_set(request, doc_type="DOC", pipeline="gotenberg")
                     logger.info(f"Binary .doc detected: {fname} -> converting via Gotenberg+PyMuPDF")
                     _t_doc = time.time()
                     doc_result = await convert_doc_to_markdown(client, fbytes, fname)
@@ -1074,6 +1335,7 @@ async def proxy(request: Request, path: str):
                     logger.info(f"PDF images: {_image_count} images in {_page_count} pages")
                 
                 pdf_type = "SCAN" if _is_scan else "TEXT PDF"
+                _stats_set(request, file_pages=_page_count or None)
                 _base_fname = fname.rsplit("/", 1)[-1] if "/" in fname else fname
                 # Убираем UUID-префикс из имени файла для пользователя
                 if "_" in _base_fname and len(_base_fname.split("_")[0]) == 36:
@@ -1084,6 +1346,7 @@ async def proxy(request: Request, path: str):
                 
                 # ── SCAN PDF + OCR SDK ENABLED → новый путь v4.0 ──
                 if _is_scan and OCR_SDK_ENABLED:
+                    _stats_set(request, doc_type="SCAN", pipeline="ocr-sdk")
                     logger.info(f"Auto-detect: {fname} -> SCAN ({_page_count} pages) -> OCR SDK path (v4.0)")
                     sdk_result = await convert_scan_via_ocr_sdk(client, fbytes, fname, vlm_overrides)
                     if sdk_result is not None:
@@ -1102,12 +1365,15 @@ async def proxy(request: Request, path: str):
                 VLM_PAGE_LIMIT = 20
                 if _is_scan:
                     pipeline_value = "vlm"
+                    _stats_set(request, doc_type="SCAN", pipeline=pipeline_value)
                     logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm (scans always use VLM)")
                 elif _page_count > VLM_PAGE_LIMIT:
                     pipeline_value = "standard"
+                    _stats_set(request, doc_type="TEXT_LONG", pipeline=pipeline_value)
                     logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=standard (>{VLM_PAGE_LIMIT} pages, text extractable)")
                 else:
                     pipeline_value = "vlm"
+                    _stats_set(request, doc_type="TEXT_SHORT", pipeline=pipeline_value)
                     logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm")
             else:
                 # Не PDF (docx, xlsx и т.д.)
@@ -1137,12 +1403,15 @@ async def proxy(request: Request, path: str):
                         pdf_name = ole_fname.rsplit(".", 1)[0] + ".pdf"
                         files[_ole_file_idx] = ("files", (pdf_name, pdf_bytes, "application/pdf"))
                         pipeline_value = "vlm"
+                        _stats_set(request, doc_type="DOCX_OLE", pipeline=pipeline_value)
                         logger.info(f"Auto-detect: {ole_fname} -> OLE -> Gotenberg -> {pdf_name} -> pipeline=vlm")
                     except Exception as e:
                         logger.error(f"Gotenberg ERROR: {e} -> fallback to standard pipeline")
                         pipeline_value = "standard"
+                        _stats_set(request, doc_type="DOCX_OLE", pipeline=pipeline_value)
                 else:
                     pipeline_value = "standard"
+                    _stats_set(request, doc_type="OTHER", pipeline=pipeline_value)
                     logger.info(f"Auto-detect: non-PDF {file_names} -> no OLE -> pipeline=standard")
 
         # ── Обновляем pipeline в data для docling ──
@@ -1213,6 +1482,25 @@ async def proxy(request: Request, path: str):
 
         _total_ms = (time.time() - _t_total) * 1000
         logger.info(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
+
+        # Финальная разметка для статистики (только docling-ветка)
+        _stats_set(
+            request,
+            duration_queue_wait_ms=int(_queue_ms),
+            duration_docling_ms=int(_docling_ms),
+        )
+        if resp.status_code == 200:
+            try:
+                _docling_body = json.loads(resp.content)
+                if isinstance(_docling_body, dict) and "timings" in _docling_body:
+                    _stats_set(request, timings_json=_docling_body["timings"])
+            except Exception:
+                pass
+        else:
+            try:
+                _stats_set(request, error_message=resp.content[:500].decode("utf-8", "replace"))
+            except Exception:
+                pass
         
         # Пост-обработка: KaTeX-совместимость
         fixed_content = fix_katex_compatibility(resp.content) if resp.status_code == 200 else resp.content
