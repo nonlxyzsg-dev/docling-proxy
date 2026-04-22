@@ -1127,10 +1127,11 @@ async def proxy(request: Request, path: str):
             # VLM уже извлекает всё — picture description избыточен
             do_pic_desc = "false"
             
-            data = [(k, v) for k, v in data if k not in ("do_picture_description", "do_picture_description_custom")]
+            data = [(k, v) for k, v in data if k not in ("do_picture_description", "do_picture_description_custom", "do_picture_classification")]
             data.append(("do_picture_description", "false"))
             data.append(("do_picture_description_custom", "false"))
-            print("VLM Pipeline: suppressed picture_description (redundant with VLM)")
+            data.append(("do_picture_classification", "false"))
+            print("VLM Pipeline: suppressed picture_description and picture_classification (redundant with full-page VLM)")
 
         # ── Picture Description: описание картинок через VLM ──
         if do_pic_desc == "true":
