@@ -402,7 +402,7 @@ def build_custom_model(vlm_overrides: dict = {}, classification: str = "false") 
         "prompt": DEFAULT_VLM_PROMPT + "\n/no_think",
         "batch_size": 1,
         "concurrency": int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY)),
-        "scale": 2.0,
+        "scale": float(vlm_overrides.get("vlm_scale", 1.5)),
         "picture_area_threshold": 0.01,
         "generation_config": {"max_new_tokens": 2048, "do_sample": False}
     }
@@ -431,7 +431,7 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
         "response_format": "markdown",
         "timeout": int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT)),
         "concurrency": int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY)),
-        "scale": 2.0,
+        "scale": float(vlm_overrides.get("vlm_scale", 1.5)),
         "temperature": 0.0
     }
     return json.dumps(config)
