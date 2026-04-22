@@ -4,10 +4,55 @@ from fastapi import FastAPI, Request, Response
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from datetime import datetime as dt
-import os, json, httpx, asyncio, zipfile, uuid, base64, re, glob
+import os, json, httpx, asyncio, zipfile, uuid, base64, re, glob, logging, sys
 import xml.etree.ElementTree as ET
 
 load_dotenv()
+
+# ═══════════════════════════════════════════════════════════════
+# Логирование
+# ═══════════════════════════════════════════════════════════════
+# LOG_LEVEL — DEBUG/INFO/WARNING/ERROR, default INFO.
+# LOG_FORMAT — text (default) или json для агрегаторов (Loki, ELK).
+# uvicorn/FastAPI-логгеры не трогаем — у них свой формат, их не глушим.
+
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()
+
+
+class _JsonFormatter(logging.Formatter):
+    """Минимальный JSON-форматтер без внешних зависимостей."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": dt.utcfromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _init_logging() -> logging.Logger:
+    handler = logging.StreamHandler(sys.stdout)
+    if _LOG_FORMAT == "json":
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+    lg = logging.getLogger("docling_proxy")
+    lg.handlers.clear()
+    lg.addHandler(handler)
+    lg.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+    lg.propagate = False  # не дублируем в root/uvicorn
+    return lg
+
+
+logger = _init_logging()
 
 # ═══════════════════════════════════════════════════════════════
 # Глобальные переменные из .env
@@ -116,7 +161,7 @@ def cleanup_old_inbox_files(max_age_seconds: int = 3600):
         except Exception:
             pass
     if count > 0:
-        print(f"[inbox cleanup] Removed {count} stale file(s) from {inbox}")
+        logger.info(f"[inbox cleanup] Removed {count} stale file(s) from {inbox}")
 
 
 async def _periodic_inbox_cleanup():
@@ -126,7 +171,7 @@ async def _periodic_inbox_cleanup():
         try:
             cleanup_old_inbox_files()
         except Exception as e:
-            print(f"[inbox cleanup] Error: {e}")
+            logger.error(f"[inbox cleanup] Error: {e}")
 
 
 @asynccontextmanager
@@ -269,7 +314,7 @@ def decode_confluence_doc(file_bytes: bytes, filename: str) -> tuple:
                     payload = part.get_payload(decode=True)
                     if payload:
                         html_name = filename.rsplit('.', 1)[0] + '.html'
-                        print(f"Confluence decode: found HTML part ({len(payload)} bytes)")
+                        logger.info(f"Confluence decode: found HTML part ({len(payload)} bytes)")
                         return payload, html_name
         
         # Single part
@@ -286,13 +331,13 @@ def decode_confluence_doc(file_bytes: bytes, filename: str) -> tuple:
                 html_part = raw[idx:]
                 decoded = quopri.decodestring(html_part.encode('utf-8', errors='ignore'))
                 html_name = filename.rsplit('.', 1)[0] + '.html'
-                print(f"Confluence decode: fallback quopri ({len(decoded)} bytes)")
+                logger.info(f"Confluence decode: fallback quopri ({len(decoded)} bytes)")
                 return decoded, html_name
         
-        print(f"Confluence decode: could not extract HTML from {filename}")
+        logger.info(f"Confluence decode: could not extract HTML from {filename}")
         return None, None
     except Exception as e:
-        print(f"Confluence decode ERROR: {e}")
+        logger.error(f"Confluence decode ERROR: {e}")
         return None, None
 
 
@@ -467,13 +512,13 @@ def fix_katex_compatibility(response_bytes: bytes) -> bytes:
         md = md.replace("&gt;", ">")
 
         if len(md) != original_len:
-            print(f"KaTeX fix: {original_len} -> {len(md)} chars")
+            logger.info(f"KaTeX fix: {original_len} -> {len(md)} chars")
         
         doc["md_content"] = md
         data["document"] = doc
         return json.dumps(data, ensure_ascii=False).encode()
     except Exception as e:
-        print(f"KaTeX fix error: {e}")
+        logger.error(f"KaTeX fix error: {e}")
         return response_bytes
 
 
@@ -547,7 +592,7 @@ def convert_xls_to_markdown(file_bytes: bytes, filename: str) -> bytes:
         }
         return json.dumps(response, ensure_ascii=False).encode()
     except Exception as e:
-        print(f"XLS conversion error: {e}")
+        logger.error(f"XLS conversion error: {e}")
         return None
 
 
@@ -563,11 +608,11 @@ async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, 
         files = [("files", (filename, file_bytes, "application/msword"))]
         resp = await client.post(gotenberg_url, files=files, timeout=120.0)
         if resp.status_code != 200:
-            print(f"DOC→PDF Gotenberg failed: HTTP {resp.status_code}")
+            logger.error(f"DOC→PDF Gotenberg failed: HTTP {resp.status_code}")
             return None
         pdf_bytes = resp.content
         _gotenberg_ms = (time.time() - _t) * 1000
-        print(f"TIMING doc→pdf (Gotenberg): {_gotenberg_ms:.0f}ms ({len(pdf_bytes)} bytes)")
+        logger.info(f"TIMING doc→pdf (Gotenberg): {_gotenberg_ms:.0f}ms ({len(pdf_bytes)} bytes)")
         
         # Шаг 2: PDF → markdown через PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -586,7 +631,7 @@ async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, 
         
         md_content = "\n".join(all_md)
         _total_ms = (time.time() - _t) * 1000
-        print(f"TIMING doc→markdown total: {_total_ms:.0f}ms ({len(md_content)} chars)")
+        logger.info(f"TIMING doc→markdown total: {_total_ms:.0f}ms ({len(md_content)} chars)")
         
         response = {
             "document": {
@@ -599,7 +644,7 @@ async def convert_doc_to_markdown(client: httpx.AsyncClient, file_bytes: bytes, 
         }
         return json.dumps(response, ensure_ascii=False).encode()
     except Exception as e:
-        print(f"DOC conversion error: {e}")
+        logger.error(f"DOC conversion error: {e}")
         return None
 
 
@@ -678,10 +723,10 @@ async def enrich_image_regions(
                     regions_to_enrich.append({"page": page_idx, "bbox": bbox, "label": label})
 
     if not regions_to_enrich:
-        print("OCR SDK enrichment: no image regions found")
+        logger.info("OCR SDK enrichment: no image regions found")
         return markdown
 
-    print(f"OCR SDK enrichment: {len(regions_to_enrich)} region(s) to describe via 122B")
+    logger.info(f"OCR SDK enrichment: {len(regions_to_enrich)} region(s) to describe via 122B")
 
     vlm_url = vlm_overrides.get("vlm_url", DEFAULT_VLM_URL)
     vlm_api_key = vlm_overrides.get("vlm_api_key", DEFAULT_VLM_API_KEY)
@@ -702,7 +747,7 @@ async def enrich_image_regions(
         page_idx = region["page"]
         x1, y1, x2, y2 = region["bbox"]
         if page_idx >= len(doc):
-            print(f"OCR SDK enrichment: page {page_idx} out of range, skipping")
+            logger.warning(f"OCR SDK enrichment: page {page_idx} out of range, skipping")
             continue
         # OCR SDK отдаёт bbox_2d в нормализованных координатах 0-1000 по каждой оси
         # (x/image_width*1000, y/image_height*1000).
@@ -720,7 +765,7 @@ async def enrich_image_regions(
             pix = page.get_pixmap(matrix=mat, clip=clip_rect)
             png_bytes_region = pix.tobytes("png")
         except Exception as e:
-            print(f"OCR SDK enrichment: render failed page={page_idx} bbox={region['bbox']}: {e}")
+            logger.error(f"OCR SDK enrichment: render failed page={page_idx} bbox={region['bbox']}: {e}")
             continue
         placeholder = f"![](page={page_idx},bbox=[{x1}, {y1}, {x2}, {y2}])"
         placeholder_map[i] = placeholder
@@ -728,7 +773,7 @@ async def enrich_image_regions(
         # Наблюдаемость: по логам калибруем пороги после выката.
         bw, bh = (x2 - x1), (y2 - y1)
         aspect = max(bw, bh) / max(min(bw, bh), 1)
-        print(
+        logger.info(
             f"OCR SDK enrichment: region p{page_idx} label={region['label']} "
             f"bbox={region['bbox']} norm_area={bw * bh} aspect={aspect:.1f} "
             f"max_tokens={max_tok}"
@@ -754,7 +799,7 @@ async def enrich_image_regions(
             continue
         placeholder = placeholder_map[i]
         if isinstance(result, Exception):
-            print(f"OCR SDK enrichment: VLM error for region {i}: {result}")
+            logger.error(f"OCR SDK enrichment: VLM error for region {i}: {result}")
             description = f"[Ошибка описания: {type(result).__name__}]"
         else:
             description = result
@@ -774,11 +819,11 @@ async def enrich_image_regions(
                 markdown = new_md
                 matched += 1
             else:
-                print(f"OCR SDK enrichment: placeholder not found for page={page} bbox={bbox}")
+                logger.warning(f"OCR SDK enrichment: placeholder not found for page={page} bbox={bbox}")
                 markdown += f"\n\n{description}\n"
                 matched += 1
 
-    print(f"OCR SDK enrichment: {matched}/{len(tasks)} descriptions inserted, {_elapsed:.0f}ms")
+    logger.info(f"OCR SDK enrichment: {matched}/{len(tasks)} descriptions inserted, {_elapsed:.0f}ms")
     return markdown
 
 
@@ -828,7 +873,7 @@ async def convert_scan_via_ocr_sdk(
     try:
         with open(inbox_path, "wb") as f:
             f.write(pdf_bytes)
-        print(f"OCR SDK: wrote {len(pdf_bytes)} bytes to {inbox_path}")
+        logger.info(f"OCR SDK: wrote {len(pdf_bytes)} bytes to {inbox_path}")
 
         sdk_payload = {"images": [f"{OCR_SDK_INBOX_CONTAINER}/{file_id}.pdf"]}
         _t_sdk = time.time()
@@ -840,7 +885,7 @@ async def convert_scan_via_ocr_sdk(
         _sdk_ms = (time.time() - _t_sdk) * 1000
 
         if sdk_resp.status_code != 200:
-            print(f"OCR SDK: HTTP {sdk_resp.status_code} after {_sdk_ms:.0f}ms")
+            logger.error(f"OCR SDK: HTTP {sdk_resp.status_code} after {_sdk_ms:.0f}ms")
             return None
 
         sdk_data = sdk_resp.json()
@@ -848,10 +893,10 @@ async def convert_scan_via_ocr_sdk(
         json_result = sdk_data.get("json_result", [])
 
         if not markdown:
-            print(f"OCR SDK: empty markdown_result after {_sdk_ms:.0f}ms")
+            logger.error(f"OCR SDK: empty markdown_result after {_sdk_ms:.0f}ms")
             return None
 
-        print(f"OCR SDK: {len(markdown)} chars markdown, {len(json_result)} pages, {_sdk_ms:.0f}ms")
+        logger.info(f"OCR SDK: {len(markdown)} chars markdown, {len(json_result)} pages, {_sdk_ms:.0f}ms")
 
         if ENRICH_PICTURES_WITH_122B and json_result:
             try:
@@ -860,9 +905,9 @@ async def convert_scan_via_ocr_sdk(
                     client, markdown, json_result, pdf_bytes, vlm_overrides
                 )
                 _enrich_ms = (time.time() - _t_enrich) * 1000
-                print(f"OCR SDK enrichment: {_enrich_ms:.0f}ms")
+                logger.info(f"OCR SDK enrichment: {_enrich_ms:.0f}ms")
             except Exception as e:
-                print(f"OCR SDK enrichment ERROR (non-fatal): {e}")
+                logger.error(f"OCR SDK enrichment ERROR (non-fatal): {e}")
 
         _total_ms = (time.time() - _t_start) * 1000
         response = {
@@ -871,21 +916,21 @@ async def convert_scan_via_ocr_sdk(
             "errors": [],
             "processing_time": _total_ms / 1000,
         }
-        print(f"TIMING ocr_sdk total: {_total_ms:.0f}ms")
+        logger.info(f"TIMING ocr_sdk total: {_total_ms:.0f}ms")
         return json.dumps(response, ensure_ascii=False).encode()
 
     except Exception as e:
         _total_ms = (time.time() - _t_start) * 1000
-        print(f"OCR SDK ERROR after {_total_ms:.0f}ms: {e}")
+        logger.error(f"OCR SDK ERROR after {_total_ms:.0f}ms: {e}")
         return None
 
     finally:
         try:
             if os.path.exists(inbox_path):
                 os.remove(inbox_path)
-                print(f"OCR SDK: cleaned up {inbox_path}")
+                logger.info(f"OCR SDK: cleaned up {inbox_path}")
         except Exception as e:
-            print(f"OCR SDK: cleanup failed {inbox_path}: {e}")
+            logger.error(f"OCR SDK: cleanup failed {inbox_path}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -908,8 +953,8 @@ async def proxy(request: Request, path: str):
         do_pic_custom = form.get("do_picture_description_custom", "").lower()
         do_classification = form.get("do_picture_classification", "").lower()
 
-        print(f"РЕЖИМ do_pic_desc: {do_pic_desc}")
-        print(f"РЕЖИМ picture_description_custom: {do_pic_custom} и classification: {do_classification}")
+        logger.info(f"РЕЖИМ do_pic_desc: {do_pic_desc}")
+        logger.info(f"РЕЖИМ picture_description_custom: {do_pic_custom} и classification: {do_classification}")
 
         vlm_overrides = {}
         files = []
@@ -931,9 +976,9 @@ async def proxy(request: Request, path: str):
             
             # Неподдерживаемый формат → дружелюбное сообщение
             if ext and ext not in SUPPORTED_EXTENSIONS:
-                print(f"UNSUPPORTED FORMAT: {fname} ({ext})")
+                logger.warning(f"UNSUPPORTED FORMAT: {fname} ({ext})")
                 _total_ms = (time.time() - _t_total) * 1000
-                print(f"TIMING total: {_total_ms:.0f}ms  status: unsupported_format")
+                logger.info(f"TIMING total: {_total_ms:.0f}ms  status: unsupported_format")
                 resp_headers = {"content-type": "application/json"}
                 return Response(
                     content=get_unsupported_response(fname),
@@ -943,30 +988,30 @@ async def proxy(request: Request, path: str):
             
             # .xls → конвертируем через xlrd в markdown и возвращаем сразу
             if ext == ".xls":
-                print(f"XLS detected: {fname} -> converting via xlrd/pandas")
+                logger.info(f"XLS detected: {fname} -> converting via xlrd/pandas")
                 _t_xls = time.time()
                 xls_result = convert_xls_to_markdown(fbytes, fname)
                 _xls_ms = (time.time() - _t_xls) * 1000
                 if xls_result:
-                    print(f"TIMING xls_convert: {_xls_ms:.0f}ms")
+                    logger.info(f"TIMING xls_convert: {_xls_ms:.0f}ms")
                     _total_ms = (time.time() - _t_total) * 1000
-                    print(f"TIMING total: {_total_ms:.0f}ms  status: 200 (xls)")
+                    logger.info(f"TIMING total: {_total_ms:.0f}ms  status: 200 (xls)")
                     resp_headers = {"content-type": "application/json"}
                     return Response(content=xls_result, status_code=200, headers=resp_headers)
                 else:
-                    print(f"XLS conversion failed, passing to docling")
+                    logger.warning(f"XLS conversion failed, passing to docling")
             
             # .doc → Confluence MIME HTML или бинарный .doc
             if ext == ".doc":
                 if is_confluence_doc(fbytes):
                     # Confluence export: MIME-encoded HTML → декодируем → подменяем на .html
-                    print(f"Confluence .doc detected: {fname}")
+                    logger.info(f"Confluence .doc detected: {fname}")
                     html_bytes, html_name = decode_confluence_doc(fbytes, fname)
                     if html_bytes:
                         files[fi] = ("files", (html_name, html_bytes, "text/html"))
-                        print(f"Confluence decode OK: {fname} -> {html_name} ({len(html_bytes)} bytes)")
+                        logger.info(f"Confluence decode OK: {fname} -> {html_name} ({len(html_bytes)} bytes)")
                     else:
-                        print(f"Confluence decode FAILED: {fname} -> returning error")
+                        logger.error(f"Confluence decode FAILED: {fname} -> returning error")
                         _total_ms = (time.time() - _t_total) * 1000
                         error_msg = (
                             f"Не удалось извлечь HTML из файла «{fname}» (Confluence export). "
@@ -980,17 +1025,17 @@ async def proxy(request: Request, path: str):
                         )
                 else:
                     # Бинарный .doc → Gotenberg → PDF → PyMuPDF → markdown
-                    print(f"Binary .doc detected: {fname} -> converting via Gotenberg+PyMuPDF")
+                    logger.info(f"Binary .doc detected: {fname} -> converting via Gotenberg+PyMuPDF")
                     _t_doc = time.time()
                     doc_result = await convert_doc_to_markdown(client, fbytes, fname)
                     _doc_ms = (time.time() - _t_doc) * 1000
                     if doc_result:
-                        print(f"TIMING doc_convert: {_doc_ms:.0f}ms")
+                        logger.info(f"TIMING doc_convert: {_doc_ms:.0f}ms")
                         _total_ms = (time.time() - _t_total) * 1000
-                        print(f"TIMING total: {_total_ms:.0f}ms  status: 200 (doc)")
+                        logger.info(f"TIMING total: {_total_ms:.0f}ms  status: 200 (doc)")
                         return Response(content=doc_result, status_code=200, headers={"content-type": "application/json"})
                     else:
-                        print(f"DOC conversion failed, passing to docling")
+                        logger.warning(f"DOC conversion failed, passing to docling")
 
         # ── Определяем pipeline (auto / vlm / standard) ──
         pipeline_value = None
@@ -1013,7 +1058,7 @@ async def proxy(request: Request, path: str):
                 _t_detect = time.time()
                 _is_scan = is_scan_pdf(fbytes)
                 _detect_ms = (time.time() - _t_detect) * 1000
-                print(f"TIMING auto-detect: {_detect_ms:.0f}ms")
+                logger.info(f"TIMING auto-detect: {_detect_ms:.0f}ms")
                 # Подсчёт страниц для маршрутизации
                 _page_count = 0
                 try:
@@ -1022,11 +1067,11 @@ async def proxy(request: Request, path: str):
                     _page_count = len(_pdf_doc)
                     _pdf_doc.close()
                 except Exception as e:
-                    print(f"WARNING: could not count pages: {e}")
+                    logger.warning(f"could not count pages: {e}")
                 # Подсчёт картинок для предупреждения
                 _image_count = count_pdf_images(fbytes) if not _is_scan else 0
                 if _image_count > 0:
-                    print(f"PDF images: {_image_count} images in {_page_count} pages")
+                    logger.info(f"PDF images: {_image_count} images in {_page_count} pages")
                 
                 pdf_type = "SCAN" if _is_scan else "TEXT PDF"
                 _base_fname = fname.rsplit("/", 1)[-1] if "/" in fname else fname
@@ -1035,35 +1080,35 @@ async def proxy(request: Request, path: str):
                     _base_fname = _base_fname.split("_", 1)[1]
                 _processing_warning = get_processing_warning(_base_fname, _page_count, _image_count, _is_scan)
                 if _processing_warning:
-                    print(f"WARNING for user: {_processing_warning}")
+                    logger.warning(f"user-facing: {_processing_warning}")
                 
                 # ── SCAN PDF + OCR SDK ENABLED → новый путь v4.0 ──
                 if _is_scan and OCR_SDK_ENABLED:
-                    print(f"Auto-detect: {fname} -> SCAN ({_page_count} pages) -> OCR SDK path (v4.0)")
+                    logger.info(f"Auto-detect: {fname} -> SCAN ({_page_count} pages) -> OCR SDK path (v4.0)")
                     sdk_result = await convert_scan_via_ocr_sdk(client, fbytes, fname, vlm_overrides)
                     if sdk_result is not None:
                         fixed_result = fix_katex_compatibility(sdk_result)
                         _total_ms = (time.time() - _t_total) * 1000
-                        print(f"TIMING total: {_total_ms:.0f}ms  status: 200 (ocr-sdk)")
+                        logger.info(f"TIMING total: {_total_ms:.0f}ms  status: 200 (ocr-sdk)")
                         return Response(
                             content=fixed_result,
                             status_code=200,
                             headers={"content-type": "application/json"},
                         )
                     else:
-                        print("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
+                        logger.warning("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
 
                 # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard
                 VLM_PAGE_LIMIT = 20
                 if _is_scan:
                     pipeline_value = "vlm"
-                    print(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm (scans always use VLM)")
+                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm (scans always use VLM)")
                 elif _page_count > VLM_PAGE_LIMIT:
                     pipeline_value = "standard"
-                    print(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=standard (>{VLM_PAGE_LIMIT} pages, text extractable)")
+                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=standard (>{VLM_PAGE_LIMIT} pages, text extractable)")
                 else:
                     pipeline_value = "vlm"
-                    print(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm")
+                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm")
             else:
                 # Не PDF (docx, xlsx и т.д.)
                 _processing_warning = ""
@@ -1082,23 +1127,23 @@ async def proxy(request: Request, path: str):
                     # DOCX с OLE → Gotenberg (DOCX→PDF) → VLM pipeline
                     ole_fname = files[_ole_file_idx][1][0]
                     ole_bytes = files[_ole_file_idx][1][1]
-                    print(f"Auto-detect: {ole_fname} -> has OLE objects -> converting via Gotenberg")
+                    logger.info(f"Auto-detect: {ole_fname} -> has OLE objects -> converting via Gotenberg")
                     try:
                         _t_gotenberg = time.time()
                         pdf_bytes = await convert_via_gotenberg(client, ole_bytes, ole_fname)
                         _gotenberg_ms = (time.time() - _t_gotenberg) * 1000
-                        print(f"TIMING gotenberg: {_gotenberg_ms:.0f}ms ({len(pdf_bytes)} bytes PDF)")
+                        logger.info(f"TIMING gotenberg: {_gotenberg_ms:.0f}ms ({len(pdf_bytes)} bytes PDF)")
                         # Подменяем файл на сконвертированный PDF
                         pdf_name = ole_fname.rsplit(".", 1)[0] + ".pdf"
                         files[_ole_file_idx] = ("files", (pdf_name, pdf_bytes, "application/pdf"))
                         pipeline_value = "vlm"
-                        print(f"Auto-detect: {ole_fname} -> OLE -> Gotenberg -> {pdf_name} -> pipeline=vlm")
+                        logger.info(f"Auto-detect: {ole_fname} -> OLE -> Gotenberg -> {pdf_name} -> pipeline=vlm")
                     except Exception as e:
-                        print(f"Gotenberg ERROR: {e} -> fallback to standard pipeline")
+                        logger.error(f"Gotenberg ERROR: {e} -> fallback to standard pipeline")
                         pipeline_value = "standard"
                 else:
                     pipeline_value = "standard"
-                    print(f"Auto-detect: non-PDF {file_names} -> no OLE -> pipeline=standard")
+                    logger.info(f"Auto-detect: non-PDF {file_names} -> no OLE -> pipeline=standard")
 
         # ── Обновляем pipeline в data для docling ──
         data = [(k, v) for k, v in data if k != "pipeline"]
@@ -1108,7 +1153,7 @@ async def proxy(request: Request, path: str):
         if pipeline_value == "standard":
             data = [(k, v) for k, v in data if k != "do_ocr"]
             data.append(("do_ocr", "false"))
-            print("Standard Pipeline: OCR disabled, images via Qwen3.5 VLM")
+            logger.info("Standard Pipeline: OCR disabled, images via Qwen3.5 VLM")
 
         # ── VLM Pipeline: страница целиком -> Qwen3-VL -> markdown ──
         if pipeline_value == "vlm":
@@ -1117,12 +1162,12 @@ async def proxy(request: Request, path: str):
             
             if "vlm_pipeline_model_api" not in keys_data:
                 data.append(("vlm_pipeline_model_api", build_vlm_pipeline_model_api(vlm_overrides)))
-                print("VLM Pipeline: injected vlm_pipeline_model_api (Qwen3-VL full-page OCR)")
+                logger.info("VLM Pipeline: injected vlm_pipeline_model_api (Qwen3-VL full-page OCR)")
                 
             # Workaround: VLM pipeline + embedded images = Pillow crash on some PDFs
             if "image_export_mode" not in keys_data:
                 data.append(("image_export_mode", "placeholder"))
-                print("VLM Pipeline: выбран image_export_mode=placeholder")
+                logger.info("VLM Pipeline: выбран image_export_mode=placeholder")
                 
             # VLM уже извлекает всё — picture description избыточен
             do_pic_desc = "false"
@@ -1131,7 +1176,7 @@ async def proxy(request: Request, path: str):
             data.append(("do_picture_description", "false"))
             data.append(("do_picture_description_custom", "false"))
             data.append(("do_picture_classification", "false"))
-            print("VLM Pipeline: suppressed picture_description and picture_classification (redundant with full-page VLM)")
+            logger.info("VLM Pipeline: suppressed picture_description and picture_classification (redundant with full-page VLM)")
 
         # ── Picture Description: описание картинок через VLM ──
         if do_pic_desc == "true":
@@ -1143,7 +1188,7 @@ async def proxy(request: Request, path: str):
                 api_json = build_picture_description_api(vlm_overrides)
                 _conc = int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY))
                 data.append(("picture_description_api", api_json))
-                print(f"Режим: picture_description_api (concurrency={_conc})")
+                logger.info(f"Режим: picture_description_api (concurrency={_conc})")
 
         # Сохранение параметров для отладки
         save(data, files)
@@ -1164,10 +1209,10 @@ async def proxy(request: Request, path: str):
             _t_docling = time.time()
             resp = await client.post(target_url, files=multipart, timeout=1200.0)
             _docling_ms = (time.time() - _t_docling) * 1000
-            print(f"TIMING queue_wait: {_queue_ms:.0f}ms  docling_request: {_docling_ms:.0f}ms")
+            logger.info(f"TIMING queue_wait: {_queue_ms:.0f}ms  docling_request: {_docling_ms:.0f}ms")
 
         _total_ms = (time.time() - _t_total) * 1000
-        print(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
+        logger.info(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
         
         # Пост-обработка: KaTeX-совместимость
         fixed_content = fix_katex_compatibility(resp.content) if resp.status_code == 200 else resp.content
