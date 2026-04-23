@@ -137,35 +137,25 @@ ENRICH_VLM_PROMPT = (
 )
 
 DEFAULT_VLM_PIPELINE_PROMPT = (
-    "Обработай эту страницу документа и верни результат в формате markdown.\n\n"
-    "ПРАВИЛА ИЗВЛЕЧЕНИЯ ТЕКСТА:\n"
-    "- Извлеки весь текст точно на языке оригинала\n"
-    "- Сохрани структуру: заголовки, списки, таблицы, форматирование\n"
-    "- Не переводи и не перефразируй текст\n\n"
-    "КРИТИЧЕСКИ ВАЖНО — ИЗБЕГАЙ БЕСКОНЕЧНОЙ ГЕНЕРАЦИИ:\n"
-    "- НЕ перечисляй пустые ячейки таблиц. Если в таблице есть пустые ячейки, "
-    "отобрази их как обычные разделители `|  |` один раз и двигайся дальше.\n"
-    "- НЕ описывай декоративные элементы: линии, рамки по ГОСТ, водяные знаки, "
-    "разлиновку листа, поля, повторяющиеся маркеры.\n"
-    "- НЕ придумывай содержимое пустых областей.\n"
-    "- Если страница почти пустая или содержит только рамку — верни только "
-    "осмысленный текст (заголовок, номер чертежа, подписи) и ЗАВЕРШИ ответ.\n\n"
-    "ПРАВИЛА ОПИСАНИЯ ВИЗУАЛЬНОГО СОДЕРЖИМОГО:\n"
-    "Если на странице есть осмысленные изображения — опиши их в квадратных скобках "
-    "кратко и по делу (не более 3-5 предложений на элемент):\n\n"
-    "• ИНЖЕНЕРНЫЕ ЧЕРТЕЖИ и ТЕХНИЧЕСКИЕ СХЕМЫ: извлеки ЗАПОЛНЕННЫЕ поля штампа "
-    "(организация, номер чертежа, дата, подписи, наименование), содержимое "
-    "спецификации (позиции с обозначениями и наименованиями), ключевые размеры "
-    "и обозначения. Пустые графы НЕ перечисляй.\n"
-    "• ГРАФИКИ и ДИАГРАММЫ: оси, единицы измерения, значения ключевых точек, "
-    "легенда, тренды, заголовок графика.\n"
-    "• ЭЛЕКТРИЧЕСКИЕ/ГИДРАВЛИЧЕСКИЕ/ПНЕВМАТИЧЕСКИЕ СХЕМЫ: компоненты, соединения, "
-    "номиналы, обозначения по ГОСТ/ISO, направления потоков.\n"
-    "• ФОТОГРАФИИ и ИЛЛЮСТРАЦИИ: что изображено, ключевые объекты, текст на "
-    "изображении, контекст.\n"
-    "• ЛОГОТИПЫ и ШТАМПЫ: краткое описание в одну строку.\n\n"
-    "Отвечай только markdown, без вступлений и пояснений. "
-    "Завершай ответ, как только весь осмысленный контент извлечён."
+    "Извлеки содержимое страницы в формате Markdown, сохраняя язык оригинала "
+    "и структуру (заголовки, списки, таблицы).\n\n"
+    "Правила вывода:\n"
+    "- В таблицах выводи только строки, где есть хотя бы одна заполненная "
+    "ячейка. Полностью пустые строки пропускай. Это нужно, чтобы результат "
+    "оставался компактным и читаемым.\n"
+    "- Декоративные элементы (рамки листа, штриховку полей, линии разметки "
+    "по ГОСТ, водяные знаки) не описывай — они не несут информации.\n"
+    "- Для инженерных чертежей извлекай:\n"
+    "  - заполненные поля штампа (организация, номер чертежа, наименование, "
+    "дата, подписи);\n"
+    "  - позиции спецификации (формат, зона, позиция, обозначение, "
+    "наименование, количество);\n"
+    "  - ключевые размеры и обозначения, видимые на чертеже.\n"
+    "- Для графиков, схем и диаграмм опиши в квадратных скобках 2–4 "
+    "предложениями: что изображено, оси/единицы, ключевые значения, компоненты.\n\n"
+    "Когда весь осмысленный контент со страницы извлечён — выведи на "
+    "отдельной строке маркер `<<<END>>>` и больше ничего не пиши. Этот "
+    "маркер обязателен, он означает завершение обработки страницы."
 )
 
 
@@ -766,6 +756,88 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
 # ═══════════════════════════════════════════════════════════════
 # Пост-обработка LaTeX для KaTeX-совместимости
 # ═══════════════════════════════════════════════════════════════
+
+# Маркер конца VLM-ответа (см. DEFAULT_VLM_PIPELINE_PROMPT).
+_VLM_END_MARKER = "<<<END>>>"
+# Пустая строка markdown-таблицы: только "|" и пробелы.
+_EMPTY_TABLE_ROW_RE = re.compile(r"^\s*\|(?:\s*\|)+\s*$")
+
+
+def fix_vlm_truncation(response_bytes: bytes) -> bytes:
+    """Обрезка VLM-ответа по stop-маркеру либо эвристически при truncation.
+
+    1) Если в md_content есть <<<END>>> — всё после маркера и сам маркер
+       удаляются. Это штатный случай, когда модель успела завершиться.
+    2) Если маркера нет И в errors виден stop_reason=length — отрезаем
+       хвост подряд идущих пустых табличных строк (loop на штампе ГОСТ),
+       после чего чистим errors/status чтобы OWUI не падал на
+       partial_success. Обрезка применяется только если после последней
+       «содержательной» строки 5+ мусорных.
+    3) При любой проблеме парсинга возвращаем исходные байты как есть —
+       пост-процессинг не должен ничего ломать.
+    """
+    try:
+        data = json.loads(response_bytes)
+    except Exception:
+        return response_bytes
+
+    doc = data.get("document")
+    if not isinstance(doc, dict):
+        return response_bytes
+    md = doc.get("md_content")
+    if not isinstance(md, str) or not md:
+        return response_bytes
+
+    original_len = len(md)
+    had_marker = _VLM_END_MARKER in md
+    was_truncated = any(
+        isinstance(e, dict)
+        and "stop_reason=length" in str(e.get("error_message", ""))
+        for e in (data.get("errors") or [])
+    )
+
+    changed = False
+
+    # 1) Штатное завершение по маркеру
+    if had_marker:
+        md = md.split(_VLM_END_MARKER, 1)[0].rstrip()
+        logger.info(
+            f"VLM post-process: <<<END>>> marker found at {original_len} → {len(md)} chars"
+        )
+        changed = True
+
+    # 2) Эвристическая обрезка хвоста пустых табличных строк при truncation
+    elif was_truncated:
+        lines = md.split("\n")
+        last_meaningful = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _EMPTY_TABLE_ROW_RE.match(line):
+                continue
+            last_meaningful = i
+        # Отсекаем, только если после содержательного хвоста 5+ мусорных строк.
+        if 0 <= last_meaningful < len(lines) - 5:
+            md = "\n".join(lines[: last_meaningful + 1]).rstrip()
+            logger.info(
+                f"VLM post-process: truncation detected (stop_reason=length), "
+                f"trimmed tail of empty table rows: {original_len} → {len(md)} chars"
+            )
+            # Преобразуем partial_success → success, чтобы OWUI не падал.
+            data["errors"] = []
+            data["status"] = "success"
+            changed = True
+
+    if not changed:
+        return response_bytes
+
+    doc["md_content"] = md
+    try:
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return response_bytes
+
 
 def fix_katex_compatibility(response_bytes: bytes) -> bytes:
     """Fix LaTeX in docling response for KaTeX rendering in OpenWebUI."""
@@ -1557,8 +1629,13 @@ async def proxy(request: Request, path: str):
             except Exception:
                 pass
         
-        # Пост-обработка: KaTeX-совместимость
-        fixed_content = fix_katex_compatibility(resp.content) if resp.status_code == 200 else resp.content
+        # Пост-обработка: сначала режем VLM-truncation (работаем с «сырым» ответом),
+        # затем KaTeX fix. При не-200 пост-процессинг пропускаем.
+        if resp.status_code == 200:
+            _vlm_fixed = fix_vlm_truncation(resp.content)
+            fixed_content = fix_katex_compatibility(_vlm_fixed)
+        else:
+            fixed_content = resp.content
         
         # Убираем Content-Length — он мог измениться после KaTeX fix
         resp_headers = dict(resp.headers)
