@@ -77,6 +77,15 @@ OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
 OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
 ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower() == "true"
 
+# ── Маршрутизация и качество рендеринга (настраивается из .env, override per-request через form-data) ──
+# Порог страниц для TEXT PDF: <=порога → VLM full-page, >порога → standard+picture_description.
+TEXT_PDF_VLM_PAGE_THRESHOLD = int(os.getenv("TEXT_PDF_VLM_PAGE_THRESHOLD", "20"))
+# scale для VLM-пайплайнов (build_vlm_pipeline_model_api и build_custom_model).
+DEFAULT_VLM_SCALE = os.getenv("DEFAULT_VLM_SCALE", "1.5")
+# images_scale для standard-пайплайна: реально влияет на разрешение картинок,
+# отправляемых в picture_description_api. 1.0 ≈ 36 DPI, 2.0 ≈ 100 DPI, 3.0 ≈ 150 DPI (A4).
+DEFAULT_IMAGES_SCALE = os.getenv("DEFAULT_IMAGES_SCALE", "2.0")
+
 # ── PostgreSQL-статистика (fire-and-forget, не влияет на latency) ──
 # При STATS_ENABLED=false весь блок выключен: очередь/пул/worker не создаются,
 # накладных расходов ноль (см. README-STATS.md).
@@ -701,7 +710,7 @@ def build_custom_model(vlm_overrides: dict = {}, classification: str = "false") 
         "prompt": DEFAULT_VLM_PROMPT + "\n/no_think",
         "batch_size": 1,
         "concurrency": int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY)),
-        "scale": float(vlm_overrides.get("vlm_scale", 1.5)),
+        "scale": float(vlm_overrides.get("vlm_scale", DEFAULT_VLM_SCALE)),
         "picture_area_threshold": 0.01,
         "generation_config": {"max_new_tokens": 2048, "do_sample": False}
     }
@@ -730,7 +739,7 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
         "response_format": "markdown",
         "timeout": int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT)),
         "concurrency": int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY)),
-        "scale": float(vlm_overrides.get("vlm_scale", 1.5)),
+        "scale": float(vlm_overrides.get("vlm_scale", DEFAULT_VLM_SCALE)),
         "temperature": 0.0
     }
     return json.dumps(config)
@@ -1361,8 +1370,13 @@ async def proxy(request: Request, path: str):
                     else:
                         logger.warning("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
 
-                # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard
-                VLM_PAGE_LIMIT = 20
+                # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard.
+                # Порог N настраивается из .env (TEXT_PDF_VLM_PAGE_THRESHOLD) или
+                # перекрывается per-request через form-field vlm_page_threshold.
+                try:
+                    VLM_PAGE_LIMIT = int(vlm_overrides.get("vlm_page_threshold", TEXT_PDF_VLM_PAGE_THRESHOLD))
+                except (TypeError, ValueError):
+                    VLM_PAGE_LIMIT = TEXT_PDF_VLM_PAGE_THRESHOLD
                 if _is_scan:
                     pipeline_value = "vlm"
                     _stats_set(request, doc_type="SCAN", pipeline=pipeline_value)
@@ -1423,6 +1437,15 @@ async def proxy(request: Request, path: str):
             data = [(k, v) for k, v in data if k != "do_ocr"]
             data.append(("do_ocr", "false"))
             logger.info("Standard Pipeline: OCR disabled, images via Qwen3.5 VLM")
+
+            # images_scale — единственный параметр, реально влияющий на разрешение
+            # картинок, отправляемых в picture_description_api (scale внутри API-блока
+            # docling игнорирует). Если клиент/OWUI уже передал images_scale в form-data
+            # — не перекрываем, иначе берём vlm_overrides["images_scale"] или env-default.
+            if "images_scale" not in [k for k, _ in data]:
+                _images_scale = vlm_overrides.get("images_scale", DEFAULT_IMAGES_SCALE)
+                data.append(("images_scale", str(_images_scale)))
+                logger.info(f"Standard Pipeline: images_scale={_images_scale}")
 
         # ── VLM Pipeline: страница целиком -> Qwen3-VL -> markdown ──
         if pipeline_value == "vlm":
