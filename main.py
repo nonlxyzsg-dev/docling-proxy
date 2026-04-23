@@ -79,12 +79,12 @@ ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower
 
 # ── Маршрутизация и качество рендеринга (настраивается из .env, override per-request через form-data) ──
 # Порог страниц для TEXT PDF: <=порога → VLM full-page, >порога → standard+picture_description.
-TEXT_PDF_VLM_PAGE_THRESHOLD = int(os.getenv("TEXT_PDF_VLM_PAGE_THRESHOLD", "20"))
+TEXT_PDF_VLM_THRESHOLD = int(os.environ.get("TEXT_PDF_VLM_THRESHOLD", "20"))
 # scale для VLM-пайплайнов (build_vlm_pipeline_model_api и build_custom_model).
-DEFAULT_VLM_SCALE = os.getenv("DEFAULT_VLM_SCALE", "1.5")
+DEFAULT_VLM_SCALE = float(os.environ.get("DEFAULT_VLM_SCALE", "1.5"))
 # images_scale для standard-пайплайна: реально влияет на разрешение картинок,
-# отправляемых в picture_description_api. 1.0 ≈ 36 DPI, 2.0 ≈ 100 DPI, 3.0 ≈ 150 DPI (A4).
-DEFAULT_IMAGES_SCALE = os.getenv("DEFAULT_IMAGES_SCALE", "2.0")
+# отправляемых в picture_description_api. Linear: 1.0 ≈ 36 DPI, 2.0 ≈ 96 DPI (A4).
+DEFAULT_IMAGES_SCALE = float(os.environ.get("DEFAULT_IMAGES_SCALE", "2.0"))
 
 # ── PostgreSQL-статистика (fire-and-forget, не влияет на latency) ──
 # При STATS_ENABLED=false весь блок выключен: очередь/пул/worker не создаются,
@@ -359,6 +359,13 @@ async def lifespan(app: FastAPI):
     )
     cleanup_old_inbox_files()
     cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
+
+    # ── Активные значения параметров конфигурации (для быстрой диагностики) ──
+    logger.info(
+        f"[CONFIG] TEXT_PDF_VLM_THRESHOLD={TEXT_PDF_VLM_THRESHOLD}, "
+        f"DEFAULT_VLM_SCALE={DEFAULT_VLM_SCALE}, "
+        f"DEFAULT_IMAGES_SCALE={DEFAULT_IMAGES_SCALE}"
+    )
 
     # ── Статистика ──
     app.state.stats_pool = None
@@ -1371,12 +1378,12 @@ async def proxy(request: Request, path: str):
                         logger.warning("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
 
                 # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard.
-                # Порог N настраивается из .env (TEXT_PDF_VLM_PAGE_THRESHOLD) или
+                # Порог N настраивается из .env (TEXT_PDF_VLM_THRESHOLD) или
                 # перекрывается per-request через form-field vlm_page_threshold.
                 try:
-                    VLM_PAGE_LIMIT = int(vlm_overrides.get("vlm_page_threshold", TEXT_PDF_VLM_PAGE_THRESHOLD))
+                    VLM_PAGE_LIMIT = int(vlm_overrides.get("vlm_page_threshold", TEXT_PDF_VLM_THRESHOLD))
                 except (TypeError, ValueError):
-                    VLM_PAGE_LIMIT = TEXT_PDF_VLM_PAGE_THRESHOLD
+                    VLM_PAGE_LIMIT = TEXT_PDF_VLM_THRESHOLD
                 if _is_scan:
                     pipeline_value = "vlm"
                     _stats_set(request, doc_type="SCAN", pipeline=pipeline_value)
@@ -1440,12 +1447,12 @@ async def proxy(request: Request, path: str):
 
             # images_scale — единственный параметр, реально влияющий на разрешение
             # картинок, отправляемых в picture_description_api (scale внутри API-блока
-            # docling игнорирует). Если клиент/OWUI уже передал images_scale в form-data
-            # — не перекрываем, иначе берём vlm_overrides["images_scale"] или env-default.
-            if "images_scale" not in [k for k, _ in data]:
-                _images_scale = vlm_overrides.get("images_scale", DEFAULT_IMAGES_SCALE)
-                data.append(("images_scale", str(_images_scale)))
-                logger.info(f"Standard Pipeline: images_scale={_images_scale}")
+            # docling игнорирует). Приоритет: vlm_overrides["images_scale"] (override
+            # от клиента через vlm_-префиксный ключ) → env-дефолт DEFAULT_IMAGES_SCALE.
+            _images_scale = vlm_overrides.get("images_scale", str(DEFAULT_IMAGES_SCALE))
+            data = [(k, v) for k, v in data if k != "images_scale"]
+            data.append(("images_scale", str(_images_scale)))
+            logger.info(f"Standard Pipeline: images_scale={_images_scale}")
 
         # ── VLM Pipeline: страница целиком -> Qwen3-VL -> markdown ──
         if pipeline_value == "vlm":
