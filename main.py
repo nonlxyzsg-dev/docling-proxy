@@ -1447,12 +1447,27 @@ async def proxy(request: Request, path: str):
 
             # images_scale — единственный параметр, реально влияющий на разрешение
             # картинок, отправляемых в picture_description_api (scale внутри API-блока
-            # docling игнорирует). Приоритет: vlm_overrides["images_scale"] (override
-            # от клиента через vlm_-префиксный ключ) → env-дефолт DEFAULT_IMAGES_SCALE.
-            _images_scale = vlm_overrides.get("images_scale", str(DEFAULT_IMAGES_SCALE))
+            # docling игнорирует). Приоритет:
+            #   1) клиентский form-field images_scale (лежит в data, без префикса vlm_)
+            #   2) vlm_overrides["images_scale"] (обратная совместимость, префикс vlm_)
+            #   3) DEFAULT_IMAGES_SCALE из env — fallback.
+            _client_images_scale = None
+            for _k, _v in data:
+                if _k == "images_scale":
+                    _client_images_scale = _v
+                    break
+            if _client_images_scale is not None:
+                _images_scale = _client_images_scale
+                _scale_source = "client"
+            elif "images_scale" in vlm_overrides:
+                _images_scale = vlm_overrides["images_scale"]
+                _scale_source = "vlm_overrides"
+            else:
+                _images_scale = str(DEFAULT_IMAGES_SCALE)
+                _scale_source = "env_default"
             data = [(k, v) for k, v in data if k != "images_scale"]
             data.append(("images_scale", str(_images_scale)))
-            logger.info(f"Standard Pipeline: images_scale={_images_scale}")
+            logger.info(f"Standard Pipeline: images_scale={_images_scale} (source={_scale_source})")
 
         # ── VLM Pipeline: страница целиком -> Qwen3-VL -> markdown ──
         if pipeline_value == "vlm":
