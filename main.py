@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, Response
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from datetime import datetime as dt
-import os, json, httpx, asyncio, zipfile, uuid, base64, re, glob, logging, sys
+import os, json, httpx, asyncio, zipfile, uuid, base64, re, glob, logging, sys, traceback
 import xml.etree.ElementTree as ET
 
 load_dotenv()
@@ -767,10 +767,15 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
 # Маркер конца VLM-ответа (см. DEFAULT_VLM_PIPELINE_PROMPT).
 # Квадратные скобки и подчёркивания стабильнее токенизируются на Qwen BBPE
 # в INT4-квантовании, чем тройные угловые скобки — поэтому маркер именно в
-# таком формате. Пост-обработка принимает точный маркер и fuzzy-вариант
-# (на редкие случаи сбоя квантования).
-_END_MARKER_STRICT_RE = re.compile(r"\[END_OF_PAGE\]")
-_END_MARKER_FUZZY_RE = re.compile(r"\[?\s*END[_\s]?OF[_\s]?PAGE\s*\]?", re.IGNORECASE)
+# таком формате. В md_content подчёркивания часто приходят экранированными
+# (`[END\_OF\_PAGE]`) — это делает markdown-рендерер docling. Регексы ниже
+# принимают обе формы. Пост-обработка удаляет ВСЕ вхождения маркера —
+# docling склеивает многостраничный вывод в один md_content, каждая
+# страница оканчивается своим маркером.
+_END_MARKER_STRICT_RE = re.compile(r"\[END(?:\\_|_)OF(?:\\_|_)PAGE\]")
+_END_MARKER_FUZZY_RE = re.compile(
+    r"\[?\s*END\\?[_\s]?OF\\?[_\s]?PAGE\s*\]?", re.IGNORECASE
+)
 # Пустая строка markdown-таблицы: только "|" и пробелы.
 _EMPTY_TABLE_ROW_RE = re.compile(r"^\s*\|(?:\s*\|)+\s*$")
 
@@ -781,36 +786,44 @@ def _log_fix_vlm(info: dict) -> None:
         f"[fix_vlm_truncation] md_len={info.get('md_len')} "
         f"had_end_marker={info.get('had_end_marker', False)} "
         f"had_fuzzy_marker={info.get('had_fuzzy_marker', False)} "
+        f"markers_found_count={info.get('markers_found_count', 0)} "
+        f"markers_removed_count={info.get('markers_removed_count', 0)} "
         f"trimmed={info.get('trimmed', False)} "
         f"action={info.get('action')}"
     )
 
 
 def fix_vlm_truncation(response_bytes: bytes):
-    """Пост-обработка ответа docling-serve по трём сценариям.
+    """Пост-обработка md_content докла.
 
-    Возвращает tuple (bytes, info_dict). info_dict содержит поля:
+    Возвращает tuple (bytes, info_dict). Поля info:
         action: md_none | md_empty | non_json | no_document | end_marker_strict
                 | end_marker_fuzzy | tail_trimmed | no_op
-        md_len: длина исходного md_content (None, если был None/not-str)
-        had_end_marker: нашли ли точный [END_OF_PAGE]
-        had_fuzzy_marker: нашли ли fuzzy-вариант
-        trimmed: была ли реально модификация содержимого
+        md_len: длина исходного md_content
+        had_end_marker / had_fuzzy_marker: нашли соответствующий вариант
+        markers_found_count / markers_removed_count
+        trimmed: была ли модификация содержимого
 
     Логика:
-      1) Точный маркер [END_OF_PAGE] → обрезаем до него, маркер удаляем.
-      2) Иначе — fuzzy-маркер (неточная токенизация из-за INT4) → то же.
-         Случай логируется отдельным warning для мониторинга.
-      3) Иначе — если в errors виден stop_reason=length И после последней
-         содержательной строки 5+ пустых табличных строк подряд → режем
-         хвост + преобразуем partial_success в success (чтобы OWUI не падал).
-      4) Иначе — no_op, возвращаем байты как есть.
+      1) Найдены точные маркеры [END_OF_PAGE] / [END\\_OF\\_PAGE] (markdown-
+         экранированные подчёркивания) → отрезаем хвост после ПОСЛЕДНЕГО
+         маркера (защита от loop-мусора после него), затем удаляем ВСЕ
+         вхождения маркера из получившегося текста. docling многостраничный
+         md_content содержит один маркер на страницу, все их удаляем.
+      2) Иначе — fuzzy-вариант (неточная токенизация на INT4) → то же.
+         Логируется отдельным WARNING с количеством найденных маркеров.
+      3) Иначе — если stop_reason=length И после последней содержательной
+         строки 5+ пустых табличных строк подряд → режем хвост и преобразуем
+         partial_success → success (чтобы OWUI не падал).
+      4) Иначе — no_op.
     """
     info = {
         "action": "no_op",
         "md_len": None,
         "had_end_marker": False,
         "had_fuzzy_marker": False,
+        "markers_found_count": 0,
+        "markers_removed_count": 0,
         "trimmed": False,
     }
     try:
@@ -852,25 +865,33 @@ def fix_vlm_truncation(response_bytes: bytes):
     changed = False
     new_md = md
 
-    # 1) Точный маркер
-    strict_m = _END_MARKER_STRICT_RE.search(md)
-    if strict_m:
+    # 1) Точные маркеры (в т.ч. экранированные markdown'ом подчёркивания)
+    strict_matches = list(_END_MARKER_STRICT_RE.finditer(md))
+    if strict_matches:
         info["had_end_marker"] = True
-        new_md = md[: strict_m.start()].rstrip()
+        info["markers_found_count"] = len(strict_matches)
+        # Обрезка мусорного хвоста ПОСЛЕ последнего маркера (защита от loop)
+        tail_cut = md[: strict_matches[-1].end()]
+        # Удаляем все оставшиеся маркеры из текста
+        new_md = _END_MARKER_STRICT_RE.sub("", tail_cut).rstrip()
+        info["markers_removed_count"] = len(strict_matches)
         info["action"] = "end_marker_strict"
         info["trimmed"] = True
         changed = True
     else:
-        # 2) Fuzzy-маркер (редкий сбой INT4-квантования)
-        fuzzy_m = _END_MARKER_FUZZY_RE.search(md)
-        if fuzzy_m:
+        # 2) Fuzzy-маркеры (неточная токенизация под INT4)
+        fuzzy_matches = list(_END_MARKER_FUZZY_RE.finditer(md))
+        if fuzzy_matches:
             info["had_fuzzy_marker"] = True
+            info["markers_found_count"] = len(fuzzy_matches)
+            sample = md[fuzzy_matches[0].start(): fuzzy_matches[0].end()]
             logger.warning(
-                f"[fix_vlm_truncation] fuzzy end-marker matched: "
-                f"«{md[fuzzy_m.start():fuzzy_m.end()]}» "
-                f"at pos {fuzzy_m.start()}/{original_len}"
+                f"[fix_vlm_truncation] fuzzy end-marker(s) matched: "
+                f"count={len(fuzzy_matches)}, first=«{sample}»"
             )
-            new_md = md[: fuzzy_m.start()].rstrip()
+            tail_cut = md[: fuzzy_matches[-1].end()]
+            new_md = _END_MARKER_FUZZY_RE.sub("", tail_cut).rstrip()
+            info["markers_removed_count"] = len(fuzzy_matches)
             info["action"] = "end_marker_fuzzy"
             info["trimmed"] = True
             changed = True
@@ -905,7 +926,8 @@ def fix_vlm_truncation(response_bytes: bytes):
         return response_bytes, info
 
     logger.info(
-        f"VLM post-process: {info['action']}: {original_len} → {len(new_md)} chars"
+        f"VLM post-process: {info['action']}: {original_len} → {len(new_md)} chars "
+        f"(markers_removed={info['markers_removed_count']})"
     )
     _log_fix_vlm(info)
     return out, info
@@ -921,6 +943,7 @@ NULL_RESPONSE_PLACEHOLDER = (
 )
 
 _NULL_RESPONSE_LOG_PATTERN = "null_response_*.json"
+_ERROR_RESPONSE_LOG_PATTERN = "error_response_*.json"
 
 
 def _save_null_response_log(
@@ -984,31 +1007,125 @@ def _save_null_response_log(
         return ""
 
 
+def _classify_error_type(
+    exc: "BaseException | None",
+    docling_status_code: "int | None",
+) -> str:
+    """Определить тип ошибки для поля error_type в дампе."""
+    if docling_status_code is not None:
+        if docling_status_code in (408, 504):
+            return "docling_timeout"
+        if 500 <= docling_status_code < 600:
+            return "docling_5xx"
+        return "other"
+    if exc is None:
+        return "other"
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return "httpx_read_timeout"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "httpx_connect"
+    if isinstance(exc, httpx.ConnectError):
+        return "httpx_connect"
+    if isinstance(exc, httpx.TimeoutException):
+        return "httpx_read_timeout"
+    if isinstance(exc, httpx.RequestError):
+        return "httpx_connect"
+    return "proxy_exception"
+
+
+def _save_error_response_log(
+    *,
+    error_type: str,
+    http_status_returned: int,
+    docling_status_code,
+    docling_response_body,
+    exception,
+    params_dict: dict,
+    file_names: list,
+    client_ip,
+    duration_ms: int,
+) -> str:
+    """Сохраняет дамп ошибочного ответа в LOG_DIR/error_response_*.json.
+    Возвращает путь к файлу (или пустую строку при ошибке записи)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    now = dt.now()
+    ts = now.strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(LOG_DIR, f"error_response_{ts}.json")
+
+    body_preview = None
+    if docling_response_body is not None:
+        try:
+            if isinstance(docling_response_body, bytes):
+                body_preview = docling_response_body[:2000].decode("utf-8", "replace")
+            else:
+                body_preview = str(docling_response_body)[:2000]
+        except Exception:
+            body_preview = None
+
+    exc_type = exc_msg = tb_str = None
+    if exception is not None:
+        exc_type = type(exception).__name__
+        try:
+            exc_msg = str(exception)
+        except Exception:
+            exc_msg = None
+        try:
+            tb_str = "".join(
+                traceback.format_exception(type(exception), exception, exception.__traceback__)
+            )
+        except Exception:
+            tb_str = None
+
+    payload = {
+        "timestamp": now.isoformat(),
+        "client_ip": client_ip,
+        "request_params": params_dict,
+        "request_files": file_names,
+        "error_type": error_type,
+        "http_status_returned_to_client": http_status_returned,
+        "docling_status_code": docling_status_code,
+        "docling_response_body": body_preview,
+        "exception_type": exc_type,
+        "exception_message": exc_msg,
+        "traceback": tb_str,
+        "duration_ms": duration_ms,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:
+        logger.error(f"[ERROR-RESPONSE] failed to save {path}: {e}")
+        return ""
+
+
 def cleanup_old_null_response_logs(max_age_seconds: int = 7 * 86400) -> None:
-    """Удаляет файлы null_response_*.json старше max_age_seconds."""
+    """Удаляет файлы null_response_*.json и error_response_*.json старше max_age_seconds."""
     if not os.path.isdir(LOG_DIR):
         return
     now = time.time()
     removed = 0
-    for p in glob.glob(os.path.join(LOG_DIR, _NULL_RESPONSE_LOG_PATTERN)):
-        try:
-            if os.path.isfile(p) and (now - os.path.getmtime(p)) > max_age_seconds:
-                os.remove(p)
-                removed += 1
-        except Exception:
-            pass
+    patterns = (_NULL_RESPONSE_LOG_PATTERN, _ERROR_RESPONSE_LOG_PATTERN)
+    for pattern in patterns:
+        for p in glob.glob(os.path.join(LOG_DIR, pattern)):
+            try:
+                if os.path.isfile(p) and (now - os.path.getmtime(p)) > max_age_seconds:
+                    os.remove(p)
+                    removed += 1
+            except Exception:
+                pass
     if removed > 0:
-        logger.info(f"[null-response cleanup] removed {removed} old log(s)")
+        logger.info(f"[diag-logs cleanup] removed {removed} old log(s)")
 
 
 async def _periodic_null_response_cleanup() -> None:
-    """Фоновая задача: чистить null_response_*.json раз в час."""
+    """Фоновая задача: чистить null_response_*.json и error_response_*.json раз в час."""
     while True:
         await asyncio.sleep(3600)
         try:
             cleanup_old_null_response_logs()
         except Exception as e:
-            logger.error(f"[null-response cleanup] error: {e}")
+            logger.error(f"[diag-logs cleanup] error: {e}")
 
 
 def fix_katex_compatibility(response_bytes: bytes) -> bytes:
@@ -1772,15 +1889,85 @@ async def proxy(request: Request, path: str):
         multipart.extend(files)
 
         _t_queue = time.time()
-        async with sem:
-            _queue_ms = (time.time() - _t_queue) * 1000
-            _t_docling = time.time()
-            resp = await client.post(target_url, files=multipart, timeout=1200.0)
-            _docling_ms = (time.time() - _t_docling) * 1000
-            logger.info(f"TIMING queue_wait: {_queue_ms:.0f}ms  docling_request: {_docling_ms:.0f}ms")
+        # Ловим httpx-исключения (таймауты, разрыв коннекта) — без этого
+        # 500 возвращается стандартным handler'ом starlette без следа в логах.
+        try:
+            async with sem:
+                _queue_ms = (time.time() - _t_queue) * 1000
+                _t_docling = time.time()
+                resp = await client.post(target_url, files=multipart, timeout=1200.0)
+                _docling_ms = (time.time() - _t_docling) * 1000
+                logger.info(f"TIMING queue_wait: {_queue_ms:.0f}ms  docling_request: {_docling_ms:.0f}ms")
+        except (httpx.TimeoutException, httpx.RequestError, Exception) as _httpx_exc:
+            _total_ms = (time.time() - _t_total) * 1000
+            _err_type = _classify_error_type(_httpx_exc, None)
+            _http_returned = 504 if "timeout" in _err_type else 502
+            _params_dict = {k: v for k, v in data}
+            _file_names = [fn for _, (fn, _, _) in files]
+            _client_ip = request.client.host if request.client else None
+            _log_path = _save_error_response_log(
+                error_type=_err_type,
+                http_status_returned=_http_returned,
+                docling_status_code=None,
+                docling_response_body=None,
+                exception=_httpx_exc,
+                params_dict=_params_dict,
+                file_names=_file_names,
+                client_ip=_client_ip,
+                duration_ms=int(_total_ms),
+            )
+            logger.error(
+                f"[ERROR-RESPONSE] saved to {_log_path}  http={_http_returned}  "
+                f"error_type={_err_type}  duration_ms={int(_total_ms)}  "
+                f"exc={type(_httpx_exc).__name__}: {_httpx_exc}"
+            )
+            _stats_set(
+                request,
+                http_status=_http_returned,
+                error_message=f"{_err_type}: {type(_httpx_exc).__name__}: {_httpx_exc}",
+                duration_total_ms=int(_total_ms),
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "status": "failure",
+                        "document": {"md_content": NULL_RESPONSE_PLACEHOLDER},
+                        "proxy_diagnostics": {
+                            "error_type": _err_type,
+                            "error_response_log": _log_path,
+                            "reason": f"{type(_httpx_exc).__name__}: {_httpx_exc}",
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                status_code=_http_returned,
+                headers={"content-type": "application/json"},
+            )
 
         _total_ms = (time.time() - _t_total) * 1000
         logger.info(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
+
+        # Дамп для docling 5xx — чтобы видеть upstream-сбои
+        if 500 <= resp.status_code < 600:
+            _err_type = _classify_error_type(None, resp.status_code)
+            _params_dict = {k: v for k, v in data}
+            _file_names = [fn for _, (fn, _, _) in files]
+            _client_ip = request.client.host if request.client else None
+            _log_path = _save_error_response_log(
+                error_type=_err_type,
+                http_status_returned=resp.status_code,
+                docling_status_code=resp.status_code,
+                docling_response_body=resp.content,
+                exception=None,
+                params_dict=_params_dict,
+                file_names=_file_names,
+                client_ip=_client_ip,
+                duration_ms=int(_total_ms),
+            )
+            logger.error(
+                f"[ERROR-RESPONSE] saved to {_log_path}  http={resp.status_code}  "
+                f"error_type={_err_type}  duration_ms={int(_total_ms)}"
+            )
 
         # Финальная разметка для статистики (только docling-ветка)
         _stats_set(
