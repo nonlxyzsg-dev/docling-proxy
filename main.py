@@ -137,25 +137,28 @@ ENRICH_VLM_PROMPT = (
 )
 
 DEFAULT_VLM_PIPELINE_PROMPT = (
-    "Извлеки содержимое страницы в формате Markdown, сохраняя язык оригинала "
-    "и структуру (заголовки, списки, таблицы).\n\n"
-    "Правила вывода:\n"
+    "Твоя задача: извлечь содержимое страницы документа в формате Markdown "
+    "и завершить ответ маркером `[END_OF_PAGE]`.\n\n"
+    "Правила извлечения:\n"
+    "- Сохраняй язык оригинала и структуру (заголовки, списки, таблицы).\n"
     "- В таблицах выводи только строки, где есть хотя бы одна заполненная "
-    "ячейка. Полностью пустые строки пропускай. Это нужно, чтобы результат "
-    "оставался компактным и читаемым.\n"
-    "- Декоративные элементы (рамки листа, штриховку полей, линии разметки "
-    "по ГОСТ, водяные знаки) не описывай — они не несут информации.\n"
-    "- Для инженерных чертежей извлекай:\n"
-    "  - заполненные поля штампа (организация, номер чертежа, наименование, "
-    "дата, подписи);\n"
-    "  - позиции спецификации (формат, зона, позиция, обозначение, "
-    "наименование, количество);\n"
-    "  - ключевые размеры и обозначения, видимые на чертеже.\n"
-    "- Для графиков, схем и диаграмм опиши в квадратных скобках 2–4 "
-    "предложениями: что изображено, оси/единицы, ключевые значения, компоненты.\n\n"
-    "Когда весь осмысленный контент со страницы извлечён — выведи на "
-    "отдельной строке маркер `<<<END>>>` и больше ничего не пиши. Этот "
-    "маркер обязателен, он означает завершение обработки страницы."
+    "ячейка. Полностью пустые строки пропускай — это нужно, чтобы результат "
+    "оставался компактным.\n"
+    "- Декоративные элементы (рамки листа, линии разметки, водяные знаки) "
+    "не описывай — они не несут информации.\n"
+    "- Для инженерных чертежей извлекай: заполненные поля штампа "
+    "(организация, номер чертежа, наименование, дата, подписи); позиции "
+    "спецификации (формат, зона, позиция, обозначение, наименование, "
+    "количество); ключевые размеры и обозначения.\n"
+    "- Для графиков, схем и диаграмм — 2–4 предложения в квадратных "
+    "скобках: что изображено, оси и единицы, ключевые значения.\n\n"
+    "Финальное правило (обязательное): после того как весь осмысленный "
+    "контент извлечён, выведи на отдельной новой строке ровно такой маркер:\n\n"
+    "[END_OF_PAGE]\n\n"
+    "Формат маркера: открывающая квадратная скобка `[`, затем `END_OF_PAGE` "
+    "заглавными латинскими буквами с подчёркиваниями, затем закрывающая "
+    "квадратная скобка `]`. Никаких пробелов внутри, никаких угловых "
+    "скобок. После маркера ничего не пиши."
 )
 
 
@@ -359,6 +362,9 @@ async def lifespan(app: FastAPI):
     )
     cleanup_old_inbox_files()
     cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
+    # Ротация null_response_*.json: при старте и раз в час.
+    cleanup_old_null_response_logs()
+    null_cleanup_task = asyncio.create_task(_periodic_null_response_cleanup())
 
     # ── Активные значения параметров конфигурации (для быстрой диагностики) ──
     logger.info(
@@ -400,6 +406,7 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
+    null_cleanup_task.cancel()
 
     # Graceful shutdown stats: дать воркеру добить очередь в пределах 10с.
     if app.state.stats_queue is not None:
@@ -758,38 +765,84 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 # Маркер конца VLM-ответа (см. DEFAULT_VLM_PIPELINE_PROMPT).
-_VLM_END_MARKER = "<<<END>>>"
+# Квадратные скобки и подчёркивания стабильнее токенизируются на Qwen BBPE
+# в INT4-квантовании, чем тройные угловые скобки — поэтому маркер именно в
+# таком формате. Пост-обработка принимает точный маркер и fuzzy-вариант
+# (на редкие случаи сбоя квантования).
+_END_MARKER_STRICT_RE = re.compile(r"\[END_OF_PAGE\]")
+_END_MARKER_FUZZY_RE = re.compile(r"\[?\s*END[_\s]?OF[_\s]?PAGE\s*\]?", re.IGNORECASE)
 # Пустая строка markdown-таблицы: только "|" и пробелы.
 _EMPTY_TABLE_ROW_RE = re.compile(r"^\s*\|(?:\s*\|)+\s*$")
 
 
-def fix_vlm_truncation(response_bytes: bytes) -> bytes:
-    """Обрезка VLM-ответа по stop-маркеру либо эвристически при truncation.
+def _log_fix_vlm(info: dict) -> None:
+    """Unconditional структурированный лог результата fix_vlm_truncation."""
+    logger.info(
+        f"[fix_vlm_truncation] md_len={info.get('md_len')} "
+        f"had_end_marker={info.get('had_end_marker', False)} "
+        f"had_fuzzy_marker={info.get('had_fuzzy_marker', False)} "
+        f"trimmed={info.get('trimmed', False)} "
+        f"action={info.get('action')}"
+    )
 
-    1) Если в md_content есть <<<END>>> — всё после маркера и сам маркер
-       удаляются. Это штатный случай, когда модель успела завершиться.
-    2) Если маркера нет И в errors виден stop_reason=length — отрезаем
-       хвост подряд идущих пустых табличных строк (loop на штампе ГОСТ),
-       после чего чистим errors/status чтобы OWUI не падал на
-       partial_success. Обрезка применяется только если после последней
-       «содержательной» строки 5+ мусорных.
-    3) При любой проблеме парсинга возвращаем исходные байты как есть —
-       пост-процессинг не должен ничего ломать.
+
+def fix_vlm_truncation(response_bytes: bytes):
+    """Пост-обработка ответа docling-serve по трём сценариям.
+
+    Возвращает tuple (bytes, info_dict). info_dict содержит поля:
+        action: md_none | md_empty | non_json | no_document | end_marker_strict
+                | end_marker_fuzzy | tail_trimmed | no_op
+        md_len: длина исходного md_content (None, если был None/not-str)
+        had_end_marker: нашли ли точный [END_OF_PAGE]
+        had_fuzzy_marker: нашли ли fuzzy-вариант
+        trimmed: была ли реально модификация содержимого
+
+    Логика:
+      1) Точный маркер [END_OF_PAGE] → обрезаем до него, маркер удаляем.
+      2) Иначе — fuzzy-маркер (неточная токенизация из-за INT4) → то же.
+         Случай логируется отдельным warning для мониторинга.
+      3) Иначе — если в errors виден stop_reason=length И после последней
+         содержательной строки 5+ пустых табличных строк подряд → режем
+         хвост + преобразуем partial_success в success (чтобы OWUI не падал).
+      4) Иначе — no_op, возвращаем байты как есть.
     """
+    info = {
+        "action": "no_op",
+        "md_len": None,
+        "had_end_marker": False,
+        "had_fuzzy_marker": False,
+        "trimmed": False,
+    }
     try:
         data = json.loads(response_bytes)
     except Exception:
-        return response_bytes
+        info["action"] = "non_json"
+        _log_fix_vlm(info)
+        return response_bytes, info
 
     doc = data.get("document")
     if not isinstance(doc, dict):
-        return response_bytes
-    md = doc.get("md_content")
-    if not isinstance(md, str) or not md:
-        return response_bytes
+        info["action"] = "no_document"
+        _log_fix_vlm(info)
+        return response_bytes, info
 
+    md = doc.get("md_content")
+    if md is None:
+        info["action"] = "md_none"
+        _log_fix_vlm(info)
+        return response_bytes, info
+    if not isinstance(md, str):
+        info["action"] = "md_none"
+        _log_fix_vlm(info)
+        return response_bytes, info
+    if md == "":
+        info["md_len"] = 0
+        info["action"] = "md_empty"
+        _log_fix_vlm(info)
+        return response_bytes, info
+
+    info["md_len"] = len(md)
     original_len = len(md)
-    had_marker = _VLM_END_MARKER in md
     was_truncated = any(
         isinstance(e, dict)
         and "stop_reason=length" in str(e.get("error_message", ""))
@@ -797,46 +850,165 @@ def fix_vlm_truncation(response_bytes: bytes) -> bytes:
     )
 
     changed = False
+    new_md = md
 
-    # 1) Штатное завершение по маркеру
-    if had_marker:
-        md = md.split(_VLM_END_MARKER, 1)[0].rstrip()
-        logger.info(
-            f"VLM post-process: <<<END>>> marker found at {original_len} → {len(md)} chars"
-        )
+    # 1) Точный маркер
+    strict_m = _END_MARKER_STRICT_RE.search(md)
+    if strict_m:
+        info["had_end_marker"] = True
+        new_md = md[: strict_m.start()].rstrip()
+        info["action"] = "end_marker_strict"
+        info["trimmed"] = True
         changed = True
-
-    # 2) Эвристическая обрезка хвоста пустых табличных строк при truncation
-    elif was_truncated:
-        lines = md.split("\n")
-        last_meaningful = -1
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _EMPTY_TABLE_ROW_RE.match(line):
-                continue
-            last_meaningful = i
-        # Отсекаем, только если после содержательного хвоста 5+ мусорных строк.
-        if 0 <= last_meaningful < len(lines) - 5:
-            md = "\n".join(lines[: last_meaningful + 1]).rstrip()
-            logger.info(
-                f"VLM post-process: truncation detected (stop_reason=length), "
-                f"trimmed tail of empty table rows: {original_len} → {len(md)} chars"
+    else:
+        # 2) Fuzzy-маркер (редкий сбой INT4-квантования)
+        fuzzy_m = _END_MARKER_FUZZY_RE.search(md)
+        if fuzzy_m:
+            info["had_fuzzy_marker"] = True
+            logger.warning(
+                f"[fix_vlm_truncation] fuzzy end-marker matched: "
+                f"«{md[fuzzy_m.start():fuzzy_m.end()]}» "
+                f"at pos {fuzzy_m.start()}/{original_len}"
             )
-            # Преобразуем partial_success → success, чтобы OWUI не падал.
-            data["errors"] = []
-            data["status"] = "success"
+            new_md = md[: fuzzy_m.start()].rstrip()
+            info["action"] = "end_marker_fuzzy"
+            info["trimmed"] = True
             changed = True
+        # 3) Эвристическая обрезка при truncation без маркера
+        elif was_truncated:
+            lines = md.split("\n")
+            last_meaningful = -1
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if _EMPTY_TABLE_ROW_RE.match(line):
+                    continue
+                last_meaningful = i
+            if 0 <= last_meaningful < len(lines) - 5:
+                new_md = "\n".join(lines[: last_meaningful + 1]).rstrip()
+                data["errors"] = []
+                data["status"] = "success"
+                info["action"] = "tail_trimmed"
+                info["trimmed"] = True
+                changed = True
 
     if not changed:
-        return response_bytes
+        _log_fix_vlm(info)
+        return response_bytes, info
 
-    doc["md_content"] = md
+    doc["md_content"] = new_md
     try:
-        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+        out = json.dumps(data, ensure_ascii=False).encode("utf-8")
     except Exception:
-        return response_bytes
+        _log_fix_vlm(info)
+        return response_bytes, info
+
+    logger.info(
+        f"VLM post-process: {info['action']}: {original_len} → {len(new_md)} chars"
+    )
+    _log_fix_vlm(info)
+    return out, info
+
+
+# ═══════════════════════════════════════════════════════════════
+# Диагностика null-ответов (md_content=null или partial_success)
+# ═══════════════════════════════════════════════════════════════
+
+NULL_RESPONSE_PLACEHOLDER = (
+    "[Документ не удалось распознать: VLM вернул пустой результат. "
+    "См. логи прокси для диагностики.]"
+)
+
+_NULL_RESPONSE_LOG_PATTERN = "null_response_*.json"
+
+
+def _save_null_response_log(
+    *,
+    resp_content: bytes,
+    http_status: int,
+    status_field,
+    md_content,
+    errors,
+    fix_info: dict,
+    params_dict: dict,
+    file_names: list,
+    client_ip,
+    total_ms: int,
+) -> str:
+    """Сохраняет полный дамп null-ответа в LOG_DIR/null_response_*.json.
+    Возвращает путь к файлу (или пустую строку при ошибке записи)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    now = dt.now()
+    ts = now.strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(LOG_DIR, f"null_response_{ts}.json")
+
+    try:
+        full_response = json.loads(resp_content)
+    except Exception:
+        full_response = {
+            "__parse_error__": True,
+            "__raw_body_preview__": resp_content[:8000].decode("utf-8", "replace"),
+        }
+
+    md_preview = None
+    md_len = None
+    if isinstance(md_content, str):
+        md_len = len(md_content)
+        if md_len > 1000:
+            md_preview = md_content[:500] + "\n...<cut>...\n" + md_content[-500:]
+        else:
+            md_preview = md_content
+
+    payload = {
+        "timestamp": now.isoformat(),
+        "client_ip": client_ip,
+        "request_params": params_dict,
+        "request_files": file_names,
+        "docling_status_code": http_status,
+        "docling_response_full": full_response,
+        "docling_md_content_preview": md_preview,
+        "docling_md_content_length": md_len,
+        "docling_errors": errors,
+        "docling_status_field": status_field,
+        "timing_total_ms": total_ms,
+        "fix_vlm_truncation_called": True,
+        "fix_vlm_truncation_result": fix_info.get("action"),
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:
+        logger.error(f"[NULL-RESPONSE] failed to save {path}: {e}")
+        return ""
+
+
+def cleanup_old_null_response_logs(max_age_seconds: int = 7 * 86400) -> None:
+    """Удаляет файлы null_response_*.json старше max_age_seconds."""
+    if not os.path.isdir(LOG_DIR):
+        return
+    now = time.time()
+    removed = 0
+    for p in glob.glob(os.path.join(LOG_DIR, _NULL_RESPONSE_LOG_PATTERN)):
+        try:
+            if os.path.isfile(p) and (now - os.path.getmtime(p)) > max_age_seconds:
+                os.remove(p)
+                removed += 1
+        except Exception:
+            pass
+    if removed > 0:
+        logger.info(f"[null-response cleanup] removed {removed} old log(s)")
+
+
+async def _periodic_null_response_cleanup() -> None:
+    """Фоновая задача: чистить null_response_*.json раз в час."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            cleanup_old_null_response_logs()
+        except Exception as e:
+            logger.error(f"[null-response cleanup] error: {e}")
 
 
 def fix_katex_compatibility(response_bytes: bytes) -> bytes:
@@ -1629,10 +1801,69 @@ async def proxy(request: Request, path: str):
             except Exception:
                 pass
         
-        # Пост-обработка: сначала режем VLM-truncation (работаем с «сырым» ответом),
-        # затем KaTeX fix. При не-200 пост-процессинг пропускаем.
+        # Пост-обработка: (1) fix_vlm_truncation на сыром ответе — обрезка по
+        # [END_OF_PAGE] / fuzzy-варианту / хвосту пустых строк. (2) Детекция
+        # null/partial_success → дамп в null_response_*.json + подстановка
+        # заглушки, чтобы OWUI не падал на Pydantic-ошибке. (3) KaTeX fix.
+        # При не-200 — пропускаем.
         if resp.status_code == 200:
-            _vlm_fixed = fix_vlm_truncation(resp.content)
+            _vlm_fixed, _vlm_info = fix_vlm_truncation(resp.content)
+
+            # Диагностика + заглушка для null/partial_success ответов.
+            try:
+                _d_data = json.loads(_vlm_fixed)
+            except Exception:
+                _d_data = None
+            _d_doc = _d_data.get("document") if isinstance(_d_data, dict) else None
+            _d_md = _d_doc.get("md_content") if isinstance(_d_doc, dict) else None
+            _d_status = _d_data.get("status") if isinstance(_d_data, dict) else None
+            _d_errors = _d_data.get("errors") if isinstance(_d_data, dict) else []
+
+            _null_trigger = (
+                _d_md is None
+                or (isinstance(_d_md, str) and _d_md == "")
+                or _d_status in ("partial_success", "failure", "skipped")
+            )
+            if _null_trigger:
+                _params_dict = {k: v for k, v in data}
+                _file_names = [fn for _, (fn, _, _) in files]
+                _client_ip = request.client.host if request.client else None
+                _log_path = _save_null_response_log(
+                    resp_content=resp.content,
+                    http_status=resp.status_code,
+                    status_field=_d_status,
+                    md_content=_d_md,
+                    errors=_d_errors or [],
+                    fix_info=_vlm_info,
+                    params_dict=_params_dict,
+                    file_names=_file_names,
+                    client_ip=_client_ip,
+                    total_ms=int(_total_ms),
+                )
+                _md_len_desc = "null" if _d_md is None else str(len(_d_md)) if isinstance(_d_md, str) else "?"
+                _err_count = len(_d_errors) if isinstance(_d_errors, list) else 0
+                logger.warning(
+                    f"[NULL-RESPONSE] saved to {_log_path}  "
+                    f"status={_d_status}  md_len={_md_len_desc}  "
+                    f"errors_count={_err_count}"
+                )
+                # Подменяем ответ на валидную заглушку
+                if isinstance(_d_data, dict) and isinstance(_d_doc, dict):
+                    _d_doc["md_content"] = NULL_RESPONSE_PLACEHOLDER
+                    _d_data["document"] = _d_doc
+                    _d_data["status"] = "success"
+                    _d_data["proxy_diagnostics"] = {
+                        "original_status": _d_status,
+                        "null_response_log": _log_path,
+                        "reason": "md_content was null or empty",
+                    }
+                    try:
+                        _vlm_fixed = json.dumps(_d_data, ensure_ascii=False).encode("utf-8")
+                    except Exception as _e:
+                        logger.error(f"[NULL-RESPONSE] failed to re-serialize stub response: {_e}")
+                # Для статистики — пометим, но не ломаем http_status
+                _stats_set(request, error_message=f"null_response: original_status={_d_status}")
+
             fixed_content = fix_katex_compatibility(_vlm_fixed)
         else:
             fixed_content = resp.content
