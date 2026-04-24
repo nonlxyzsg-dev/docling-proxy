@@ -67,7 +67,7 @@ DEFAULT_VLM_API_KEY = os.getenv("DEFAULT_VLM_API_KEY")
 DEFAULT_VLM_MODEL = os.getenv("DEFAULT_VLM_MODEL")
 DEFAULT_VLM_TIMEOUT = os.getenv("DEFAULT_VLM_TIMEOUT")
 DEFAULT_VLM_CONCURRENCY = os.getenv("DEFAULT_VLM_CONCURRENCY")
-DEFAULT_VLM_MAX_CONCURRENT_DOCS = os.getenv("DEFAULT_VLM_MAX_CONCURRENT_DOCS")
+DEFAULT_VLM_MAX_CONCURRENT_DOCS = os.getenv("DEFAULT_VLM_MAX_CONCURRENT_DOCS", "2")
 DEFAULT_VLM_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_VLM_MAX_COMPLETION_TOKENS", "2048"))
 
 # ── OCR SDK интеграция (v4.0) ──
@@ -478,6 +478,10 @@ def get_semaphore(max_docs: int) -> asyncio.Semaphore:
     if _semaphore is None or _semaphore_value != max_docs:
         _semaphore = asyncio.Semaphore(max_docs)
         _semaphore_value = max_docs
+        # Лог для диагностики: при workers>1 каждый воркер создаст свой
+        # семафор и мы увидим в логах разные pid'ы — это и есть симптом
+        # рассинхрона. При workers=1 pid должен быть один и тот же.
+        logger.info(f"[semaphore] (re)created: max_docs={max_docs}  pid={os.getpid()}")
     return _semaphore
 
 
