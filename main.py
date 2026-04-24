@@ -95,6 +95,13 @@ STATS_QUEUE_SIZE = int(os.getenv("STATS_QUEUE_SIZE", "10000"))
 STATS_BATCH_SIZE = int(os.getenv("STATS_BATCH_SIZE", "50"))
 STATS_FLUSH_INTERVAL_SEC = float(os.getenv("STATS_FLUSH_INTERVAL_SEC", "5"))
 
+# ── Retry на upstream-сбои docling (только httpx-исключения и 502/503/504) ──
+# Не ретраим 500, 4xx и partial_success: первое часто воспроизводимо, последнее
+# держит семафор впустую. Retry проходит ВНУТРИ семафора, чтобы общий cap
+# vlm_max_concurrent_docs не пробивался.
+DOCLING_RETRY_MAX_ATTEMPTS = int(os.getenv("DOCLING_RETRY_MAX_ATTEMPTS", "2"))
+DOCLING_RETRY_BACKOFF_SEC = float(os.getenv("DOCLING_RETRY_BACKOFF_SEC", "1.0"))
+
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
 DEFAULT_VLM_PROMPT = (
@@ -941,10 +948,25 @@ def fix_vlm_truncation(response_bytes: bytes):
 # Диагностика null-ответов (md_content=null или partial_success)
 # ═══════════════════════════════════════════════════════════════
 
-NULL_RESPONSE_PLACEHOLDER = (
-    "[Документ не удалось распознать: VLM вернул пустой результат. "
-    "См. логи прокси для диагностики.]"
-)
+def make_null_response_markdown(request_id: str = "") -> str:
+    """Дружелюбная заглушка для OWUI с указанием времени и request_id.
+
+    Вызывается после исчерпания ретраев либо при null/partial_success от
+    docling-serve. Даёт пользователю понять, что документ не обработан,
+    что делать, и ID для обращения к админу.
+    """
+    rid_short = request_id[:8] if request_id else "—"
+    return (
+        "# ⚠️ Документ не распознан\n\n"
+        "Не удалось обработать этот документ. Пожалуйста, попробуйте "
+        "загрузить его ещё раз.\n\n"
+        "Если проблема повторится:\n"
+        "- попробуйте загрузить меньший фрагмент (до 20 страниц);\n"
+        "- проверьте, что документ не защищён паролем;\n"
+        "- обратитесь к администратору.\n\n"
+        "---\n"
+        f"_Время: {dt.now().isoformat(timespec='seconds')}  ID: {rid_short}_"
+    )
 
 _NULL_RESPONSE_LOG_PATTERN = "null_response_*.json"
 _ERROR_RESPONSE_LOG_PATTERN = "error_response_*.json"
@@ -962,6 +984,9 @@ def _save_null_response_log(
     file_names: list,
     client_ip,
     total_ms: int,
+    request_id: str = "",
+    attempts_made: int = 1,
+    retry_reasons: list = None,
 ) -> str:
     """Сохраняет полный дамп null-ответа в LOG_DIR/null_response_*.json.
     Возвращает путь к файлу (или пустую строку при ошибке записи)."""
@@ -989,6 +1014,9 @@ def _save_null_response_log(
 
     payload = {
         "timestamp": now.isoformat(),
+        "request_id": request_id,
+        "attempts_made": attempts_made,
+        "retry_reasons": retry_reasons or [],
         "client_ip": client_ip,
         "request_params": params_dict,
         "request_files": file_names,
@@ -1048,6 +1076,9 @@ def _save_error_response_log(
     file_names: list,
     client_ip,
     duration_ms: int,
+    request_id: str = "",
+    attempts_made: int = 1,
+    retry_reasons: list = None,
 ) -> str:
     """Сохраняет дамп ошибочного ответа в LOG_DIR/error_response_*.json.
     Возвращает путь к файлу (или пустую строку при ошибке записи)."""
@@ -1082,6 +1113,9 @@ def _save_error_response_log(
 
     payload = {
         "timestamp": now.isoformat(),
+        "request_id": request_id,
+        "attempts_made": attempts_made,
+        "retry_reasons": retry_reasons or [],
         "client_ip": client_ip,
         "request_params": params_dict,
         "request_files": file_names,
@@ -1592,6 +1626,19 @@ async def proxy(request: Request, path: str):
 
     if "multipart/form-data" in content_type and "convert/file" in path:
 
+        # Сквозной request_id для корреляции в логах, дампах и Langfuse.
+        # Отправляется в docling как X-Request-Id (docling/LiteLLM могут
+        # прокинуть его дальше в trace).
+        _request_id = str(uuid.uuid4())
+        _rid8 = _request_id[:8]
+        # Синхронизируем с stats, чтобы в docling_requests.request_id
+        # лежал тот же uuid, что и в dumps.
+        _req_stats = getattr(request.state, "stats", None) if hasattr(request, "state") else None
+        if isinstance(_req_stats, dict):
+            _req_stats["request_id"] = uuid.UUID(_request_id)
+
+        logger.info(f"[rid={_rid8}] START /convert/file")
+
         form = await request.form()
 
         do_pic_desc = form.get("do_picture_description", "").lower()
@@ -1892,19 +1939,63 @@ async def proxy(request: Request, path: str):
             multipart.append((key, (None, val)))
         multipart.extend(files)
 
+        _docling_headers = {"X-Request-Id": _request_id}
         _t_queue = time.time()
-        # Ловим httpx-исключения (таймауты, разрыв коннекта) — без этого
-        # 500 возвращается стандартным handler'ом starlette без следа в логах.
-        try:
-            async with sem:
-                _queue_ms = (time.time() - _t_queue) * 1000
-                _t_docling = time.time()
-                resp = await client.post(target_url, files=multipart, timeout=1200.0)
-                _docling_ms = (time.time() - _t_docling) * 1000
-                logger.info(f"TIMING queue_wait: {_queue_ms:.0f}ms  docling_request: {_docling_ms:.0f}ms")
-        except (httpx.TimeoutException, httpx.RequestError, Exception) as _httpx_exc:
+        _queue_ms = 0.0
+        _docling_ms = 0.0
+        _attempts_made = 0
+        _retry_reasons: list = []
+        _last_exc = None
+        resp = None
+        # Retry ВНУТРИ семафора на каждой попытке: не пробиваем общий
+        # cap=vlm_max_concurrent_docs, зато держим слот дольше при ретраях.
+        # Повторяем только на httpx-исключениях и 502/503/504 (upstream-сбой);
+        # 500 и 4xx — не ретраим (часто repeatable).
+        for _attempt in range(1, DOCLING_RETRY_MAX_ATTEMPTS + 1):
+            _attempts_made = _attempt
+            try:
+                async with sem:
+                    if _attempt == 1:
+                        _queue_ms = (time.time() - _t_queue) * 1000
+                    _t_docling = time.time()
+                    resp = await client.post(
+                        target_url,
+                        files=multipart,
+                        headers=_docling_headers,
+                        timeout=1200.0,
+                    )
+                    _docling_ms = (time.time() - _t_docling) * 1000
+                # Ретраим на 502/503/504
+                if resp.status_code in (502, 503, 504) and _attempt < DOCLING_RETRY_MAX_ATTEMPTS:
+                    _reason = f"docling_{resp.status_code}"
+                    _retry_reasons.append(_reason)
+                    logger.warning(
+                        f"[rid={_rid8}] attempt {_attempt}/{DOCLING_RETRY_MAX_ATTEMPTS}: "
+                        f"{_reason}, retrying after {DOCLING_RETRY_BACKOFF_SEC}s"
+                    )
+                    await asyncio.sleep(DOCLING_RETRY_BACKOFF_SEC)
+                    continue
+                break  # success/4xx/500/нечего ретраить — выходим
+            except (httpx.TimeoutException, httpx.RequestError) as _exc:
+                _last_exc = _exc
+                _reason = _classify_error_type(_exc, None)
+                _retry_reasons.append(_reason)
+                if _attempt < DOCLING_RETRY_MAX_ATTEMPTS:
+                    logger.warning(
+                        f"[rid={_rid8}] attempt {_attempt}/{DOCLING_RETRY_MAX_ATTEMPTS}: "
+                        f"{_reason} ({type(_exc).__name__}: {_exc}), "
+                        f"retrying after {DOCLING_RETRY_BACKOFF_SEC}s"
+                    )
+                    await asyncio.sleep(DOCLING_RETRY_BACKOFF_SEC)
+                    continue
+                # Попытки кончились — выпадаем ниже и отдадим дамп + заглушку
+                resp = None
+                break
+
+        # Если все попытки упали с httpx-исключением — нет resp, отдаём дамп.
+        if resp is None and _last_exc is not None:
             _total_ms = (time.time() - _t_total) * 1000
-            _err_type = _classify_error_type(_httpx_exc, None)
+            _err_type = _classify_error_type(_last_exc, None)
             _http_returned = 504 if "timeout" in _err_type else 502
             _params_dict = {k: v for k, v in data}
             _file_names = [fn for _, (fn, _, _) in files]
@@ -1914,32 +2005,39 @@ async def proxy(request: Request, path: str):
                 http_status_returned=_http_returned,
                 docling_status_code=None,
                 docling_response_body=None,
-                exception=_httpx_exc,
+                exception=_last_exc,
                 params_dict=_params_dict,
                 file_names=_file_names,
                 client_ip=_client_ip,
                 duration_ms=int(_total_ms),
+                request_id=_request_id,
+                attempts_made=_attempts_made,
+                retry_reasons=_retry_reasons,
             )
             logger.error(
-                f"[ERROR-RESPONSE] saved to {_log_path}  http={_http_returned}  "
-                f"error_type={_err_type}  duration_ms={int(_total_ms)}  "
-                f"exc={type(_httpx_exc).__name__}: {_httpx_exc}"
+                f"[ERROR-RESPONSE] [rid={_rid8}] saved to {_log_path}  "
+                f"http={_http_returned}  error_type={_err_type}  "
+                f"attempts={_attempts_made}  duration_ms={int(_total_ms)}  "
+                f"exc={type(_last_exc).__name__}: {_last_exc}"
             )
             _stats_set(
                 request,
                 http_status=_http_returned,
-                error_message=f"{_err_type}: {type(_httpx_exc).__name__}: {_httpx_exc}",
+                error_message=f"{_err_type}: {type(_last_exc).__name__}: {_last_exc}",
                 duration_total_ms=int(_total_ms),
             )
             return Response(
                 content=json.dumps(
                     {
                         "status": "failure",
-                        "document": {"md_content": NULL_RESPONSE_PLACEHOLDER},
+                        "document": {"md_content": make_null_response_markdown(_request_id)},
                         "proxy_diagnostics": {
                             "error_type": _err_type,
                             "error_response_log": _log_path,
-                            "reason": f"{type(_httpx_exc).__name__}: {_httpx_exc}",
+                            "reason": f"{type(_last_exc).__name__}: {_last_exc}",
+                            "request_id": _request_id,
+                            "attempts_made": _attempts_made,
+                            "retry_reasons": _retry_reasons,
                         },
                     },
                     ensure_ascii=False,
@@ -1948,8 +2046,14 @@ async def proxy(request: Request, path: str):
                 headers={"content-type": "application/json"},
             )
 
+        logger.info(
+            f"TIMING queue_wait: {_queue_ms:.0f}ms  "
+            f"docling_request: {_docling_ms:.0f}ms  "
+            f"attempts={_attempts_made}"
+        )
+
         _total_ms = (time.time() - _t_total) * 1000
-        logger.info(f"TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}")
+        logger.info(f"[rid={_rid8}] TIMING total: {_total_ms:.0f}ms  status: {resp.status_code}  attempts={_attempts_made}")
 
         # Дамп для docling 5xx — чтобы видеть upstream-сбои
         if 500 <= resp.status_code < 600:
@@ -1967,10 +2071,14 @@ async def proxy(request: Request, path: str):
                 file_names=_file_names,
                 client_ip=_client_ip,
                 duration_ms=int(_total_ms),
+                request_id=_request_id,
+                attempts_made=_attempts_made,
+                retry_reasons=_retry_reasons,
             )
             logger.error(
-                f"[ERROR-RESPONSE] saved to {_log_path}  http={resp.status_code}  "
-                f"error_type={_err_type}  duration_ms={int(_total_ms)}"
+                f"[ERROR-RESPONSE] [rid={_rid8}] saved to {_log_path}  "
+                f"http={resp.status_code}  error_type={_err_type}  "
+                f"attempts={_attempts_made}  duration_ms={int(_total_ms)}"
             )
 
         # Финальная разметка для статистики (только docling-ветка)
@@ -2030,23 +2138,29 @@ async def proxy(request: Request, path: str):
                     file_names=_file_names,
                     client_ip=_client_ip,
                     total_ms=int(_total_ms),
+                    request_id=_request_id,
+                    attempts_made=_attempts_made,
+                    retry_reasons=_retry_reasons,
                 )
                 _md_len_desc = "null" if _d_md is None else str(len(_d_md)) if isinstance(_d_md, str) else "?"
                 _err_count = len(_d_errors) if isinstance(_d_errors, list) else 0
                 logger.warning(
-                    f"[NULL-RESPONSE] saved to {_log_path}  "
+                    f"[NULL-RESPONSE] [rid={_rid8}] saved to {_log_path}  "
                     f"status={_d_status}  md_len={_md_len_desc}  "
-                    f"errors_count={_err_count}"
+                    f"errors_count={_err_count}  attempts={_attempts_made}"
                 )
                 # Подменяем ответ на валидную заглушку
                 if isinstance(_d_data, dict) and isinstance(_d_doc, dict):
-                    _d_doc["md_content"] = NULL_RESPONSE_PLACEHOLDER
+                    _d_doc["md_content"] = make_null_response_markdown(_request_id)
                     _d_data["document"] = _d_doc
                     _d_data["status"] = "success"
                     _d_data["proxy_diagnostics"] = {
                         "original_status": _d_status,
                         "null_response_log": _log_path,
                         "reason": "md_content was null or empty",
+                        "request_id": _request_id,
+                        "attempts_made": _attempts_made,
+                        "retry_reasons": _retry_reasons,
                     }
                     try:
                         _vlm_fixed = json.dumps(_d_data, ensure_ascii=False).encode("utf-8")
