@@ -102,6 +102,61 @@ STATS_FLUSH_INTERVAL_SEC = float(os.getenv("STATS_FLUSH_INTERVAL_SEC", "5"))
 DOCLING_RETRY_MAX_ATTEMPTS = int(os.getenv("DOCLING_RETRY_MAX_ATTEMPTS", "2"))
 DOCLING_RETRY_BACKOFF_SEC = float(os.getenv("DOCLING_RETRY_BACKOFF_SEC", "1.0"))
 
+# ── VLM proxy gateway (sampling injection + truncate analytics) ──
+# Прокси выступает gateway'ем между docling-serve и LiteLLM/SGLang. Когда
+# VLM_PROXY_ENABLED=true, build_*() инжектируют в конфиги docling-serve
+# url=VLM_PROXY_URL?profile=... , и docling-serve ходит сначала сюда.
+# Прокси добавляет sampling-параметры из соответствующего профиля,
+# системный промпт, считает truncate-кейсы и форвардит в upstream
+# (LiteLLM). Подробнее — README.md, раздел «VLM endpoint».
+VLM_PROXY_ENABLED = os.getenv("VLM_PROXY_ENABLED", "false").lower() == "true"
+VLM_PROXY_URL = os.getenv("VLM_PROXY_URL", "").strip()
+# Upstream для самого прокси. Backwards-compat: если VLM_UPSTREAM_URL не
+# задан — используем DEFAULT_VLM_URL/DEFAULT_VLM_API_KEY (LiteLLM).
+VLM_UPSTREAM_URL = os.getenv("VLM_UPSTREAM_URL", "").strip() or DEFAULT_VLM_URL
+VLM_UPSTREAM_API_KEY = (
+    os.getenv("VLM_UPSTREAM_API_KEY", "").strip() or DEFAULT_VLM_API_KEY
+)
+
+VLM_REQUEST_LOG_FILE = os.getenv("VLM_REQUEST_LOG_FILE", "./logs/vlm_requests.jsonl")
+VLM_TRUNCATE_LOG_DIR = os.getenv("VLM_TRUNCATE_LOG_DIR", "./logs/truncated")
+VLM_TRUNCATE_SAVE_PAYLOAD = os.getenv("VLM_TRUNCATE_SAVE_PAYLOAD", "true").lower() == "true"
+VLM_TRUNCATE_RETENTION_DAYS = int(os.getenv("VLM_TRUNCATE_RETENTION_DAYS", "30"))
+
+
+def _load_sampling_profile(prefix: str) -> dict:
+    """Собрать словарь sampling-параметров из ENV.
+
+    Все параметры опциональные: пустой ENV → ключ не попадает в результат
+    → upstream получает значение по умолчанию (SGLang/LiteLLM). Это даёт
+    возможность отключать конкретный параметр без правки кода.
+    """
+    spec = {
+        "TEMPERATURE":        ("temperature",        float),
+        "TOP_P":              ("top_p",              float),
+        "TOP_K":              ("top_k",              int),
+        "MIN_P":              ("min_p",              float),
+        "PRESENCE_PENALTY":   ("presence_penalty",   float),
+        "REPETITION_PENALTY": ("repetition_penalty", float),
+        "MAX_TOKENS":         ("max_tokens",         int),
+    }
+    out: dict = {}
+    for env_key, (api_key, caster) in spec.items():
+        raw = os.getenv(f"{prefix}_{env_key}", "").strip()
+        if raw == "":
+            continue
+        try:
+            out[api_key] = caster(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"VLM sampling: bad value for {prefix}_{env_key}={raw!r}, skipped"
+            )
+    return out
+
+
+VLM_FULL_PAGE_SAMPLING = _load_sampling_profile("VLM_FULL_PAGE")
+VLM_PICTURE_DESC_SAMPLING = _load_sampling_profile("VLM_PICTURE_DESC")
+
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
 DEFAULT_VLM_PROMPT = (
@@ -166,6 +221,81 @@ DEFAULT_VLM_PIPELINE_PROMPT = (
     "заглавными латинскими буквами с подчёркиваниями, затем закрывающая "
     "квадратная скобка `]`. Никаких пробелов внутри, никаких угловых "
     "скобок. После маркера ничего не пиши."
+)
+
+# Системный промпт для VLM endpoint, профиль full_page (полностраничный
+# OCR через /v1/chat/completions?profile=full_page). Зафиксирован после
+# калибровки sampling Qwen3.5-122B-GPTQ-Int4 в апреле 2026 — содержит
+# reframing'и таблиц, защиту от описательного loop'а на пустых ячейках,
+# инструкции по инженерным чертежам и /no_think в конце для надёжного
+# отключения thinking mode на сторону модели.
+DEFAULT_VLM_FULL_PAGE_PROMPT = (
+    "Извлеки содержимое страницы в формате Markdown, сохраняя язык оригинала.\n\n"
+    "Текст:\n"
+    "- Копируй дословно, без перевода и перефразирования.\n"
+    "- Сохраняй структуру: заголовки, абзацы, списки, цитаты, подписи под изображениями, колонтитулы.\n"
+    "- Многоколоночный текст читай по колонкам, сверху вниз слева направо.\n\n"
+    "Формулы:\n"
+    "- Математические формулы выводи в LaTeX: $формула$ для inline и $$формула$$ для блочных.\n\n"
+    "Визуальный контент — описывай в квадратных скобках, только если он несёт информацию:\n"
+    "- Фотографии, иллюстрации, графики, диаграммы, схемы, чертежи, карты — 2–4 предложения: "
+    "что изображено, ключевые объекты, оси и значения для графиков, компоненты и связи для схем.\n"
+    "- Инженерные чертежи — дополнительно извлекай заполненные поля штампа "
+    "(организация, номер, наименование, дата, подписи) и позиции спецификации.\n"
+    "- Логотипы, печати, штампы — одна строка с описанием.\n"
+    "- Декоративные элементы (виньетки, орнаменты, разделители глав, буквицы, узорные рамки, "
+    "фоновые водяные знаки, разлиновка по ГОСТ) — пропускай, не описывай.\n\n"
+    "Если страница пустая или содержит только декор — верни пустой ответ.\n\n"
+    "Таблицы — это данные, а не визуальная сетка:\n"
+    "- Читай таблицу строго построчно, сверху вниз, слева направо. Не перескакивай по столбцам.\n"
+    "- После последней строки с данными остановись. Пустые строки внизу таблицы "
+    "(незаполненная сетка) — это место для будущих записей, их не выводи и не достраивай.\n"
+    "- Столбцы, пустые во всех строках, исключай из вывода целиком.\n"
+    "- Если столбец имеет подзаголовки (например, `Кол.` делится на `-` и `-01`), выводи их "
+    "как отдельные столбцы с именами `Кол.(-)` и `Кол.(-01)`.\n"
+    "- Если строка содержит подчёркнутый или курсивный заголовок-разделитель раздела "
+    "(например, «Документация», «Сборочные единицы», «Стандартные изделия», «Материалы», "
+    "«Прочие изделия», «Комплекты») — выводи его как отдельную строку `### Заголовок` перед "
+    "продолжением таблицы, не как ячейку таблицы.\n"
+    "- Если в столбце `Обозначение` или `Наименование` запись занимает две строки сетки "
+    "(например, название на первой строке и ГОСТ/ТУ на второй) — объединяй обе в одну ячейку "
+    "через перенос строки `<br>` или пробел.\n"
+    "- Строки, где не заполнена ни одна ячейка, не выводи.\n"
+    "- Если в строке заполнена только одна ячейка — выводи её не как строку таблицы, "
+    "а пунктом списка: `- значение` или `- поле: значение`.\n\n"
+    "/no_think"
+)
+
+# Системный промпт для VLM endpoint, профиль picture_desc (описание
+# вырезанного региона/картинки в standard pipeline). Совпадает с
+# DEFAULT_VLM_PROMPT — он адекватен для описания регионов и не требует
+# изменений по итогам калибровки апреля 2026.
+DEFAULT_VLM_PICTURE_DESC_PROMPT = DEFAULT_VLM_PROMPT
+
+
+def _load_prompt_from_file(env_var: str, default: str) -> str:
+    """Прочитать промпт из файла по пути из ENV. Пустой/несуществующий → default."""
+    path = os.getenv(env_var, "").strip()
+    if not path:
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            logger.warning(f"VLM prompt: file {path} empty, falling back to default")
+            return default
+        logger.info(f"VLM prompt: loaded {env_var} from {path} ({len(content)} chars)")
+        return content
+    except Exception as e:
+        logger.warning(f"VLM prompt: cannot read {env_var}={path}: {e}; using default")
+        return default
+
+
+VLM_FULL_PAGE_PROMPT = _load_prompt_from_file(
+    "VLM_PROMPT_FULL_PAGE_FILE", DEFAULT_VLM_FULL_PAGE_PROMPT
+)
+VLM_PICTURE_DESC_PROMPT = _load_prompt_from_file(
+    "VLM_PROMPT_PICTURE_DESC_FILE", DEFAULT_VLM_PICTURE_DESC_PROMPT
 )
 
 
@@ -372,12 +502,32 @@ async def lifespan(app: FastAPI):
     # Ротация null_response_*.json: при старте и раз в час.
     cleanup_old_null_response_logs()
     null_cleanup_task = asyncio.create_task(_periodic_null_response_cleanup())
+    # Ротация truncate-дампов VLM endpoint'а: при старте и раз в сутки.
+    cleanup_old_truncate_dumps()
+    truncate_cleanup_task = asyncio.create_task(_periodic_truncate_dumps_cleanup())
 
     # ── Активные значения параметров конфигурации (для быстрой диагностики) ──
     logger.info(
         f"[CONFIG] TEXT_PDF_VLM_THRESHOLD={TEXT_PDF_VLM_THRESHOLD}, "
         f"DEFAULT_VLM_SCALE={DEFAULT_VLM_SCALE}, "
         f"DEFAULT_IMAGES_SCALE={DEFAULT_IMAGES_SCALE}"
+    )
+    # ── VLM endpoint конфиг (показываем без секретов) ──
+    logger.info(
+        f"[VLM-PROXY] enabled={VLM_PROXY_ENABLED} "
+        f"proxy_url={VLM_PROXY_URL or '<unset>'} "
+        f"upstream={VLM_UPSTREAM_URL} "
+        f"truncate_dir={VLM_TRUNCATE_LOG_DIR} "
+        f"save_payload={VLM_TRUNCATE_SAVE_PAYLOAD} "
+        f"retention_days={VLM_TRUNCATE_RETENTION_DAYS}"
+    )
+    logger.info(
+        f"[VLM-PROXY] full_page sampling={VLM_FULL_PAGE_SAMPLING} "
+        f"prompt_chars={len(VLM_FULL_PAGE_PROMPT)}"
+    )
+    logger.info(
+        f"[VLM-PROXY] picture_desc sampling={VLM_PICTURE_DESC_SAMPLING} "
+        f"prompt_chars={len(VLM_PICTURE_DESC_PROMPT)}"
     )
 
     # ── Статистика ──
@@ -414,6 +564,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task.cancel()
     null_cleanup_task.cancel()
+    truncate_cleanup_task.cancel()
 
     # Graceful shutdown stats: дать воркеру добить очередь в пределах 10с.
     if app.state.stats_queue is not None:
@@ -692,6 +843,23 @@ def get_processing_warning(filename: str, page_count: int, image_count: int, is_
 
 
 
+def _vlm_proxy_url(profile: str) -> str:
+    """URL для инжекции в конфиги docling-serve.
+
+    При VLM_PROXY_ENABLED=true и заданном VLM_PROXY_URL — указывает на
+    сам прокси с нужным профилем (sampling и system-prompt инжектируются
+    уже самим прокси). При false — fallback на DEFAULT_VLM_URL (поведение
+    до v4.0, прямой ход docling-serve в LiteLLM/SGLang).
+
+    Это даёт безопасный путь миграции: деплой → прогон smoke на
+    /v1/chat/completions → переключение флага в .env → рестарт.
+    """
+    if VLM_PROXY_ENABLED and VLM_PROXY_URL:
+        sep = "&" if "?" in VLM_PROXY_URL else "?"
+        return f"{VLM_PROXY_URL}{sep}profile={profile}"
+    return DEFAULT_VLM_URL
+
+
 def build_picture_description_api(vlm_overrides: dict) -> str:
     params = {"model": vlm_overrides.get("vlm_model", DEFAULT_VLM_MODEL), "chat_template_kwargs": {"enable_thinking": False}}
     if "vlm_temperature" in vlm_overrides:
@@ -699,7 +867,7 @@ def build_picture_description_api(vlm_overrides: dict) -> str:
     if "vlm_max_tokens" in vlm_overrides:
         params["max_tokens"] = int(vlm_overrides["vlm_max_tokens"])
     api_config = {
-        "url": vlm_overrides.get("vlm_url", DEFAULT_VLM_URL),
+        "url": vlm_overrides.get("vlm_url", _vlm_proxy_url("picture_desc")),
         "headers": {"Authorization": f"Bearer {vlm_overrides.get('vlm_api_key', DEFAULT_VLM_API_KEY)}"},
         "params": params,
         "timeout": int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT)),
@@ -751,9 +919,16 @@ def build_custom_model(vlm_overrides: dict = {}, classification: str = "false") 
 
 
 def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
-    """VlmModelApi flat format for vlm_pipeline_model_api."""
+    """VlmModelApi flat format for vlm_pipeline_model_api.
+
+    Sampling-параметры (temperature, top_p, top_k, min_p, presence_penalty,
+    repetition_penalty, max_tokens) теперь инжектируются на уровне VLM
+    proxy (см. _vlm_proxy_url + endpoint /v1/chat/completions). Здесь их
+    больше нет — иначе значение из proxy перетёрлось бы значением из
+    конфига docling-serve. Убран и зашитый ранее `temperature: 0.0`.
+    """
     config = {
-        "url": vlm_overrides.get("vlm_url", DEFAULT_VLM_URL),
+        "url": vlm_overrides.get("vlm_url", _vlm_proxy_url("full_page")),
         "headers": {"Authorization": f"Bearer {vlm_overrides.get('vlm_api_key', DEFAULT_VLM_API_KEY)}"},
         "params": {
             "model": vlm_overrides.get("vlm_model", DEFAULT_VLM_MODEL),
@@ -765,7 +940,6 @@ def build_vlm_pipeline_model_api(vlm_overrides: dict = {}) -> str:
         "timeout": int(vlm_overrides.get("vlm_timeout", DEFAULT_VLM_TIMEOUT)),
         "concurrency": int(vlm_overrides.get("vlm_concurrency", DEFAULT_VLM_CONCURRENCY)),
         "scale": float(vlm_overrides.get("vlm_scale", DEFAULT_VLM_SCALE)),
-        "temperature": 0.0
     }
     return json.dumps(config)
 
@@ -1610,6 +1784,547 @@ async def convert_scan_via_ocr_sdk(
                 logger.info(f"OCR SDK: cleaned up {inbox_path}")
         except Exception as e:
             logger.error(f"OCR SDK: cleanup failed {inbox_path}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# VLM endpoint: /v1/chat/completions с инжекцией sampling и аналитикой
+# ═══════════════════════════════════════════════════════════════
+# Endpoint выступает gateway'ем между docling-serve и LiteLLM/SGLang.
+# Регистрируется ВЫШЕ catch-all `/{path:path}` (FastAPI-роутинг идёт по
+# порядку объявления). При ?profile=full_page|picture_desc прокси:
+#   1) инжектирует sampling-параметры из ENV соответствующего профиля,
+#      если клиент их не переопределил;
+#   2) добавляет system-промпт, если в messages нет роли system;
+#   3) добавляет chat_template_kwargs.enable_thinking=false;
+#   4) подменяет Authorization на Bearer ${VLM_UPSTREAM_API_KEY};
+#   5) форвардит на VLM_UPSTREAM_URL (LiteLLM);
+#   6) пишет одну строку в vlm_requests_<DATE>.jsonl;
+#   7) при finish_reason=length — асинхронно сохраняет дамп в
+#      ${VLM_TRUNCATE_LOG_DIR}/<DATE>/<request_id>/.
+# Тело ответа клиенту НЕ модифицируется (passthrough).
+
+_VLM_OPENAI_SAMPLING_KEYS = {
+    "temperature", "top_p", "top_k", "min_p",
+    "presence_penalty", "frequency_penalty", "repetition_penalty",
+    "max_tokens", "max_completion_tokens",
+}
+
+
+def _vlm_request_log_path_for(date_str: str) -> str:
+    """`vlm_requests_<DATE>.jsonl` рядом с базовым именем VLM_REQUEST_LOG_FILE.
+
+    Параметр VLM_REQUEST_LOG_FILE трактуется как путь-шаблон: каталог +
+    базовое имя; реальные файлы — с дневным суффиксом.
+    """
+    base_dir = os.path.dirname(VLM_REQUEST_LOG_FILE) or "."
+    base = os.path.basename(VLM_REQUEST_LOG_FILE) or "vlm_requests.jsonl"
+    stem, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".jsonl"
+    return os.path.join(base_dir, f"{stem}_{date_str}{ext}")
+
+
+def _vlm_log_request(record: dict) -> None:
+    """Append-only запись одной строки в дневной JSONL.
+
+    workers=1 в Dockerfile → один писатель, без блокировок. PIPE_BUF
+    гарантирует атомарность строки до 4KB на ext4. Запись синхронная,
+    но дешёвая (<1 мс при <1 МБ payload — у нас он сотни байт).
+    """
+    try:
+        os.makedirs(os.path.dirname(VLM_REQUEST_LOG_FILE) or ".", exist_ok=True)
+        date_str = dt.utcnow().strftime("%Y-%m-%d")
+        path = _vlm_request_log_path_for(date_str)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logger.error(f"[vlm-log] failed to write: {e}")
+
+
+def _vlm_strip_images_in_place(body: dict, save_to_dir: "str | None") -> int:
+    """Извлечь все base64-картинки из messages[].content[] и подменить URL.
+
+    Если save_to_dir задан — декодирует и сохраняет картинки как
+    page_<i>.png рядом с request.json. URL в самом теле всегда
+    подменяется на маркер, чтобы request.json не разрастался от base64.
+    Возвращает количество найденных картинок.
+    """
+    count = 0
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        return 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if not isinstance(c, dict) or c.get("type") != "image_url":
+                continue
+            iu = c.get("image_url")
+            if not isinstance(iu, dict):
+                continue
+            url = iu.get("url", "")
+            if not (isinstance(url, str) and url.startswith("data:")):
+                continue
+            placeholder = f"<see page_{count}.png>"
+            if save_to_dir is not None:
+                try:
+                    _, b64 = url.split(",", 1)
+                    with open(os.path.join(save_to_dir, f"page_{count}.png"), "wb") as f:
+                        f.write(base64.b64decode(b64))
+                except Exception as e:
+                    logger.warning(f"[vlm-truncate-dump] image decode failed: {e}")
+                    placeholder = f"<base64 stripped (decode failed: {type(e).__name__})>"
+            else:
+                placeholder = "<base64 stripped>"
+            iu["url"] = placeholder
+            count += 1
+    return count
+
+
+def _vlm_save_truncate_dump(
+    *,
+    request_id: str,
+    profile: str,
+    model: str,
+    request_body: dict,
+    response_data,
+    prompt_tokens,
+    completion_tokens,
+    elapsed_ms: int,
+    sampling_used: dict,
+    max_tokens_requested,
+) -> None:
+    """Синхронный дамп truncate-кейса. Вызывается из asyncio.to_thread.
+
+    Создаёт ${VLM_TRUNCATE_LOG_DIR}/<YYYY-MM-DD>/<request_id>/ с
+    request.json, response.json, meta.json и (опционально) page_*.png.
+    """
+    try:
+        date_str = dt.utcnow().strftime("%Y-%m-%d")
+        out_dir = os.path.join(VLM_TRUNCATE_LOG_DIR, date_str, request_id)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Глубокая копия — чтобы не трогать исходное тело, которое уже
+        # отправлено upstream. Самый простой способ: round-trip через JSON.
+        try:
+            body_clean = json.loads(json.dumps(request_body, default=str))
+        except Exception:
+            body_clean = request_body
+
+        if VLM_TRUNCATE_SAVE_PAYLOAD:
+            _vlm_strip_images_in_place(body_clean, out_dir)
+            try:
+                with open(os.path.join(out_dir, "request.json"), "w", encoding="utf-8") as f:
+                    json.dump(body_clean, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"[vlm-truncate-dump] request.json failed: {e}")
+            if response_data is not None:
+                try:
+                    with open(os.path.join(out_dir, "response.json"), "w", encoding="utf-8") as f:
+                        json.dump(response_data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.error(f"[vlm-truncate-dump] response.json failed: {e}")
+        else:
+            # Компактный режим: без request/response/картинок, только meta.
+            _vlm_strip_images_in_place(body_clean, None)
+
+        meta = {
+            "request_id": request_id,
+            "ts": dt.utcnow().isoformat() + "Z",
+            "profile": profile,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "max_tokens_requested": max_tokens_requested,
+            "max_tokens_used": completion_tokens,
+            "finish_reason": "length",
+            "elapsed_ms": elapsed_ms,
+            "sampling_params_used": sampling_used,
+            "save_payload": VLM_TRUNCATE_SAVE_PAYLOAD,
+        }
+        try:
+            with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[vlm-truncate-dump] meta.json failed: {e}")
+        logger.info(
+            f"[vlm-truncate-dump] saved {out_dir} "
+            f"(profile={profile} compl_tok={completion_tokens})"
+        )
+    except Exception as e:
+        logger.error(f"[vlm-truncate-dump] failed for {request_id}: {e}")
+
+
+def cleanup_old_truncate_dumps(retention_days: "int | None" = None) -> None:
+    """Удаляет каталоги старше retention_days в VLM_TRUNCATE_LOG_DIR."""
+    days = retention_days if retention_days is not None else VLM_TRUNCATE_RETENTION_DAYS
+    if not os.path.isdir(VLM_TRUNCATE_LOG_DIR):
+        return
+    cutoff = time.time() - (days * 86400)
+    removed = 0
+    try:
+        import shutil
+        for entry in os.listdir(VLM_TRUNCATE_LOG_DIR):
+            full = os.path.join(VLM_TRUNCATE_LOG_DIR, entry)
+            if not os.path.isdir(full):
+                continue
+            try:
+                if os.path.getmtime(full) < cutoff:
+                    shutil.rmtree(full, ignore_errors=True)
+                    removed += 1
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[truncate cleanup] error: {e}")
+    if removed > 0:
+        logger.info(
+            f"[truncate cleanup] removed {removed} day-dir(s) older than {days}d"
+        )
+
+
+async def _periodic_truncate_dumps_cleanup() -> None:
+    """Раз в сутки чистит дампы старше VLM_TRUNCATE_RETENTION_DAYS."""
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            cleanup_old_truncate_dumps()
+        except Exception as e:
+            logger.error(f"[truncate cleanup] error: {e}")
+
+
+def _vlm_inject_sampling(body: dict, profile_sampling: dict) -> None:
+    """Положить значения из profile_sampling в body, если клиент их не задал.
+
+    Клиентское значение всегда приоритетнее. max_tokens — отдельный
+    случай: если клиент задал max_completion_tokens, это эквивалент,
+    второй ключ инжектировать не нужно.
+    """
+    for key, val in profile_sampling.items():
+        if key == "max_tokens":
+            if "max_tokens" in body or "max_completion_tokens" in body:
+                continue
+            body["max_tokens"] = val
+        else:
+            if key in body:
+                continue
+            body[key] = val
+
+
+def _vlm_inject_system_prompt(body: dict, prompt: str) -> None:
+    """Добавить system-сообщение в начало messages, если его там нет."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        body["messages"] = [{"role": "system", "content": prompt}]
+        return
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            return
+    body["messages"] = [{"role": "system", "content": prompt}] + messages
+
+
+def _vlm_inject_chat_template_kwargs(body: dict) -> None:
+    """Дублирующая защита от thinking mode: enable_thinking=false."""
+    ctk = body.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        return
+    if "enable_thinking" not in ctk:
+        ctk["enable_thinking"] = False
+
+
+@app.post("/v1/chat/completions")
+async def vlm_chat_completions(request: Request):
+    profile = (request.query_params.get("profile") or "").strip().lower()
+    if profile == "":
+        logger.warning("VLM endpoint: profile not specified, defaulting to full_page")
+        profile = "full_page"
+    if profile not in ("full_page", "picture_desc"):
+        return Response(
+            content=json.dumps(
+                {"error": {"message": f"unknown profile: {profile}",
+                           "type": "invalid_request_error"}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=400,
+            headers={"content-type": "application/json"},
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(
+            content=json.dumps(
+                {"error": {"message": "invalid JSON body",
+                           "type": "invalid_request_error"}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=400,
+            headers={"content-type": "application/json"},
+        )
+
+    if not isinstance(body, dict):
+        return Response(
+            content=json.dumps(
+                {"error": {"message": "body must be a JSON object",
+                           "type": "invalid_request_error"}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=400,
+            headers={"content-type": "application/json"},
+        )
+
+    if body.get("stream"):
+        return Response(
+            content=json.dumps(
+                {"error": {"message": "streaming is not supported by the VLM proxy",
+                           "type": "invalid_request_error"}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=400,
+            headers={"content-type": "application/json"},
+        )
+
+    sampling = (
+        VLM_FULL_PAGE_SAMPLING if profile == "full_page" else VLM_PICTURE_DESC_SAMPLING
+    )
+    sys_prompt = (
+        VLM_FULL_PAGE_PROMPT if profile == "full_page" else VLM_PICTURE_DESC_PROMPT
+    )
+
+    _vlm_inject_sampling(body, sampling)
+    _vlm_inject_system_prompt(body, sys_prompt)
+    _vlm_inject_chat_template_kwargs(body)
+
+    sampling_used = {k: body.get(k) for k in _VLM_OPENAI_SAMPLING_KEYS if k in body}
+
+    request_id = str(uuid.uuid4())
+    rid8 = request_id[:8]
+    model = body.get("model", "")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {VLM_UPSTREAM_API_KEY}",
+        "X-Request-Id": request_id,
+    }
+
+    client: httpx.AsyncClient = request.app.state.client
+    _t = time.time()
+    try:
+        upstream_resp = await client.post(
+            VLM_UPSTREAM_URL, json=body, headers=headers,
+            timeout=httpx.Timeout(1200.0, connect=10.0),
+        )
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        elapsed_ms = int((time.time() - _t) * 1000)
+        err_type = _classify_error_type(exc, None)
+        http_returned = 504 if "timeout" in err_type else 502
+        logger.warning(
+            f"[vlm rid={rid8}] upstream {err_type}: {type(exc).__name__}: {exc} "
+            f"after {elapsed_ms}ms"
+        )
+        _vlm_log_request({
+            "ts": dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+            "request_id": request_id,
+            "profile": profile,
+            "model": model,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "finish_reason": None,
+            "elapsed_ms": elapsed_ms,
+            "status": "error",
+            "error": f"{err_type}: {type(exc).__name__}",
+        })
+        return Response(
+            content=json.dumps(
+                {"error": {"message": f"upstream {err_type}",
+                           "type": "upstream_error"}},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=http_returned,
+            headers={"content-type": "application/json", "X-Request-ID": request_id},
+        )
+
+    elapsed_ms = int((time.time() - _t) * 1000)
+    upstream_status = upstream_resp.status_code
+
+    finish_reason = None
+    prompt_tokens = None
+    completion_tokens = None
+    response_data = None
+    if upstream_resp.headers.get("content-type", "").startswith("application/json"):
+        try:
+            response_data = upstream_resp.json()
+        except Exception:
+            response_data = None
+
+    if isinstance(response_data, dict):
+        choices = response_data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get("finish_reason")
+        usage = response_data.get("usage") or {}
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+
+    if upstream_status >= 400:
+        status = "error"
+    elif finish_reason == "length":
+        status = "truncated"
+    else:
+        status = "ok"
+
+    _vlm_log_request({
+        "ts": dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+        "request_id": request_id,
+        "profile": profile,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "finish_reason": finish_reason,
+        "elapsed_ms": elapsed_ms,
+        "status": status,
+        "upstream_status": upstream_status,
+    })
+
+    if status == "truncated":
+        max_tokens_requested = body.get("max_tokens") or body.get("max_completion_tokens")
+        # Дамп в фоне, чтобы не задерживать ответ клиенту.
+        asyncio.create_task(asyncio.to_thread(
+            _vlm_save_truncate_dump,
+            request_id=request_id,
+            profile=profile,
+            model=model,
+            request_body=body,
+            response_data=response_data,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            elapsed_ms=elapsed_ms,
+            sampling_used=sampling_used,
+            max_tokens_requested=max_tokens_requested,
+        ))
+        logger.info(
+            f"[vlm rid={rid8}] truncated profile={profile} compl_tok={completion_tokens} "
+            f"elapsed={elapsed_ms}ms"
+        )
+
+    resp_headers = {"X-Request-ID": request_id}
+    ct = upstream_resp.headers.get("content-type")
+    if ct:
+        resp_headers["content-type"] = ct
+    return Response(
+        content=upstream_resp.content,
+        status_code=upstream_status,
+        headers=resp_headers,
+    )
+
+
+@app.get("/_stats/vlm")
+async def stats_vlm(date: str = ""):
+    """Агрегированная сводка по vlm_requests_<DATE>.jsonl за дату.
+
+    Лимит 100k строк — для стабильного p99. Для больших объёмов —
+    внешний агрегатор (Loki/ELK), здесь только быстрый sanity-check.
+    """
+    if not date:
+        date = dt.utcnow().strftime("%Y-%m-%d")
+    try:
+        dt.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return Response(
+            content=json.dumps(
+                {"error": "invalid date, expected YYYY-MM-DD"},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=400,
+            headers={"content-type": "application/json"},
+        )
+
+    path = _vlm_request_log_path_for(date)
+    if not os.path.isfile(path):
+        return {
+            "date": date,
+            "total": 0,
+            "by_profile": {},
+            "by_model": {},
+            "p50_elapsed_ms": None,
+            "p95_elapsed_ms": None,
+        }
+
+    LIMIT = 100_000
+    rows: list = []
+    too_large = False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= LIMIT:
+                    too_large = True
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception as e:
+        return Response(
+            content=json.dumps(
+                {"error": f"failed to read log: {e}"}, ensure_ascii=False,
+            ).encode("utf-8"),
+            status_code=500,
+            headers={"content-type": "application/json"},
+        )
+
+    if too_large:
+        return {
+            "date": date,
+            "warning": f"file too large (>{LIMIT} lines), use external aggregator",
+            "limit": LIMIT,
+            "partial_total": len(rows),
+        }
+
+    by_profile: dict = {}
+    by_model: dict = {}
+    elapsed: list = []
+    for r in rows:
+        prof = r.get("profile") or "unknown"
+        st = r.get("status") or "unknown"
+        bp = by_profile.setdefault(
+            prof, {"ok": 0, "truncated": 0, "error": 0, "truncate_rate": 0.0}
+        )
+        if st in bp:
+            bp[st] += 1
+        m = r.get("model")
+        if m:
+            by_model[m] = by_model.get(m, 0) + 1
+        ms = r.get("elapsed_ms")
+        if isinstance(ms, (int, float)):
+            elapsed.append(ms)
+
+    for prof, counts in by_profile.items():
+        total_for_prof = counts["ok"] + counts["truncated"] + counts["error"]
+        if total_for_prof > 0:
+            counts["truncate_rate"] = round(
+                counts["truncated"] / total_for_prof * 100, 2
+            )
+
+    elapsed.sort()
+    p50 = elapsed[len(elapsed) // 2] if elapsed else None
+    p95 = (
+        elapsed[min(int(len(elapsed) * 0.95), len(elapsed) - 1)]
+        if elapsed else None
+    )
+
+    return {
+        "date": date,
+        "total": len(rows),
+        "by_profile": by_profile,
+        "by_model": by_model,
+        "p50_elapsed_ms": p50,
+        "p95_elapsed_ms": p95,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
