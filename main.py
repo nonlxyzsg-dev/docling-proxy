@@ -102,6 +102,49 @@ def _env_bool(name: str, default: bool) -> bool:
     logger.warning(f"[config] {name}={raw!r} not a boolean, using default={default}")
     return default
 
+
+def _resolve_int_threshold(payload_value, env_value: int, env_source: str, name: str, rid8: str):
+    """Резолв payload > env > default для целочисленных параметров.
+
+    Возвращает (value, source). Невалидные значения (не-int, отрицательные,
+    пустая строка) → fallback на env с WARNING.
+    """
+    if payload_value is None:
+        return env_value, env_source
+    s = str(payload_value).strip()
+    if s == "":
+        return env_value, env_source
+    try:
+        v = int(s)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"[rid={rid8}] {name}={s!r} not a valid int, fallback to env"
+        )
+        return env_value, env_source
+    if v < 0:
+        logger.warning(
+            f"[rid={rid8}] {name}={v} negative, fallback to env"
+        )
+        return env_value, env_source
+    return v, "payload"
+
+
+def _resolve_bool_flag(payload_value, env_value: bool, env_source: str, name: str, rid8: str):
+    """Резолв payload > env > default для булевых параметров (true/1/yes/on)."""
+    if payload_value is None:
+        return env_value, env_source
+    s = str(payload_value).strip().lower()
+    if s == "":
+        return env_value, env_source
+    if s in ("true", "1", "yes", "on"):
+        return True, "payload"
+    if s in ("false", "0", "no", "off"):
+        return False, "payload"
+    logger.warning(
+        f"[rid={rid8}] {name}={s!r} not a boolean, fallback to env"
+    )
+    return env_value, env_source
+
 # ═══════════════════════════════════════════════════════════════
 # Глобальные переменные из .env
 # ═══════════════════════════════════════════════════════════════
@@ -127,7 +170,20 @@ ENRICH_PICTURES_WITH_122B = _env_bool("ENRICH_PICTURES_WITH_122B", default=True)
 
 # ── Маршрутизация и качество рендеринга (настраивается из .env, override per-request через form-data) ──
 # Порог страниц для TEXT PDF: <=порога → VLM full-page, >порога → standard+picture_description.
-TEXT_PDF_VLM_THRESHOLD = int(os.environ.get("TEXT_PDF_VLM_THRESHOLD", "20"))
+# 0 → TEXT PDF никогда не идёт в VLM (всегда standard).
+_TEXT_PDF_VLM_THRESHOLD_DEFAULT = 20
+TEXT_PDF_VLM_THRESHOLD = int(
+    os.environ.get("TEXT_PDF_VLM_THRESHOLD")
+    or _TEXT_PDF_VLM_THRESHOLD_DEFAULT
+)
+TEXT_PDF_VLM_THRESHOLD_SOURCE = "env" if os.environ.get("TEXT_PDF_VLM_THRESHOLD") else "default"
+
+# Отправлять ли SCAN PDF в VLM full-page. False → SCAN идёт в standard
+# pipeline (docling сам OCR'ит и режет на полигоны через picture
+# description). По умолчанию True — VLM качественнее на сканах.
+_SCAN_PDF_FULL_PAGE_DEFAULT = True
+SCAN_PDF_FULL_PAGE = _env_bool("SCAN_PDF_FULL_PAGE", default=_SCAN_PDF_FULL_PAGE_DEFAULT)
+SCAN_PDF_FULL_PAGE_SOURCE = "env" if os.environ.get("SCAN_PDF_FULL_PAGE") else "default"
 # scale для VLM-пайплайнов (build_vlm_pipeline_model_api и build_custom_model).
 DEFAULT_VLM_SCALE = float(os.environ.get("DEFAULT_VLM_SCALE", "1.5"))
 # images_scale для standard-пайплайна: реально влияет на разрешение картинок,
@@ -549,10 +605,19 @@ def _stats_set(request: Request, **fields) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # uvicorn ставит свои handlers через Config.configure_logging() ПОСЛЕ
-    # импорта main.py — переопределяем здесь, к моменту первого запроса
-    # access/error логи уже идут через наш formatter с timestamp + level.
-    _retrofit_uvicorn_loggers()
+    # uvicorn timestamps настраиваются через --log-config /proxy/log_config.json
+    # (см. Dockerfile). Раньше здесь был вызов _retrofit_uvicorn_loggers(),
+    # но при некоторых режимах запуска uvicorn переустанавливал handlers
+    # уже после lifespan — JSON-конфиг надёжнее. Для случая запуска без
+    # --log-config (тесты, локальный uvicorn) функция сохранена и может
+    # быть вызвана вручную: _retrofit_uvicorn_loggers().
+    # Диагностика: какие handlers стоят на uvicorn.access после старта.
+    _ua = logging.getLogger("uvicorn.access")
+    logger.info(
+        f"[startup-diag] uvicorn.access handlers={len(_ua.handlers)} "
+        f"level={logging.getLevelName(_ua.level)} "
+        f"propagate={_ua.propagate}"
+    )
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(1200.0, connect=10.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -2595,6 +2660,10 @@ async def proxy(request: Request, path: str):
         logger.info(f"РЕЖИМ picture_description_custom: {do_pic_custom} и classification: {do_classification}")
 
         vlm_overrides = {}
+        # Параметры роутинга, не имеющие префикса vlm_ — выделяем в
+        # отдельный словарь, чтобы не пробрасывать их в docling
+        # (он про них не знает) и резолвить per-request.
+        routing_overrides = {}
         files = []
         data = []
 
@@ -2605,6 +2674,8 @@ async def proxy(request: Request, path: str):
                 files.append(("files", (field.filename, content, field.content_type)))
             elif key.startswith("vlm_"):
                 vlm_overrides[key] = str(field)
+            elif key == "scan_pdf_full_page":
+                routing_overrides[key] = str(field)
             else:
                 data.append((key, str(field)))
 
@@ -2745,25 +2816,37 @@ async def proxy(request: Request, path: str):
                     else:
                         logger.warning("OCR SDK FALLBACK: SDK failed, falling back to VLM 122B full-page")
 
-                # Маршрутизация: SCAN → всегда VLM, TEXT PDF > N стр. → standard.
-                # Порог N настраивается из .env (TEXT_PDF_VLM_THRESHOLD) или
-                # перекрывается per-request через form-field vlm_page_threshold.
-                try:
-                    VLM_PAGE_LIMIT = int(vlm_overrides.get("vlm_page_threshold", TEXT_PDF_VLM_THRESHOLD))
-                except (TypeError, ValueError):
-                    VLM_PAGE_LIMIT = TEXT_PDF_VLM_THRESHOLD
+                # ── Резолв роутинговых параметров: payload > env > default ──
+                #   vlm_page_threshold: сколько страниц TEXT PDF можно
+                #     гнать в VLM. 0 → TEXT никогда не идёт в VLM.
+                #   scan_pdf_full_page: SCAN → VLM (true) или
+                #     SCAN → standard (false, docling сам OCR'ит).
+                _vpt, _vpt_src = _resolve_int_threshold(
+                    vlm_overrides.get("vlm_page_threshold"),
+                    TEXT_PDF_VLM_THRESHOLD, TEXT_PDF_VLM_THRESHOLD_SOURCE,
+                    "vlm_page_threshold", _rid8,
+                )
+                _scan_full, _scan_full_src = _resolve_bool_flag(
+                    routing_overrides.get("scan_pdf_full_page"),
+                    SCAN_PDF_FULL_PAGE, SCAN_PDF_FULL_PAGE_SOURCE,
+                    "scan_pdf_full_page", _rid8,
+                )
+
                 if _is_scan:
-                    pipeline_value = "vlm"
+                    pipeline_value = "vlm" if _scan_full else "standard"
                     _stats_set(request, doc_type="SCAN", pipeline=pipeline_value)
-                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm (scans always use VLM)")
-                elif _page_count > VLM_PAGE_LIMIT:
-                    pipeline_value = "standard"
-                    _stats_set(request, doc_type="TEXT_LONG", pipeline=pipeline_value)
-                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=standard (>{VLM_PAGE_LIMIT} pages, text extractable)")
-                else:
+                elif _vpt > 0 and _page_count <= _vpt:
                     pipeline_value = "vlm"
                     _stats_set(request, doc_type="TEXT_SHORT", pipeline=pipeline_value)
-                    logger.info(f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> pipeline=vlm")
+                else:
+                    pipeline_value = "standard"
+                    _stats_set(request, doc_type="TEXT_LONG", pipeline=pipeline_value)
+                logger.info(
+                    f"Auto-detect: {fname} -> {pdf_type} ({_page_count} pages) -> "
+                    f"pipeline={pipeline_value} "
+                    f"(scan_pdf_full_page={_scan_full} source={_scan_full_src}, "
+                    f"vlm_page_threshold={_vpt} source={_vpt_src})"
+                )
             else:
                 # Не PDF (docx, xlsx и т.д.)
                 _processing_warning = ""

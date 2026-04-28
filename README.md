@@ -65,6 +65,31 @@ Streaming (`stream: true`) сейчас не поддерживается — en
 
 ---
 
+## PDF routing
+
+Прокси автоматически выбирает pipeline для каждого PDF между `vlm` (full-page OCR через Qwen3.5-122B) и `standard` (текстовое извлечение + picture description). Решение зависит от типа документа (SCAN / TEXT) и числа страниц.
+
+| Случай | Параметр | Действие |
+|---|---|---|
+| SCAN PDF | `scan_pdf_full_page=true` | → `vlm` (full-page) |
+| SCAN PDF | `scan_pdf_full_page=false` | → `standard` (docling сам OCR'ит) |
+| TEXT PDF, страниц `≤ vlm_page_threshold` | `vlm_page_threshold=N` | → `vlm` |
+| TEXT PDF, страниц `> vlm_page_threshold` | | → `standard` |
+| TEXT PDF, любой объём | `vlm_page_threshold=0` | → `standard` (никогда не VLM) |
+
+**Приоритет источников:** `payload (form-data)` > `.env` > хардкод. Хардкоды: `vlm_page_threshold=20`, `scan_pdf_full_page=true`.
+
+В логе автодетекта виден применённый источник:
+```
+Auto-detect: file.pdf -> SCAN (50 pages) -> pipeline=vlm (scan_pdf_full_page=true source=payload, vlm_page_threshold=20 source=env)
+```
+
+`source=payload`/`env`/`default` отвечает на вопрос «где прокси взял значение».
+
+Ручной override `pipeline=vlm|standard` в payload OWUI по-прежнему перебивает любой автоматический роутинг.
+
+---
+
 ## Smoke-тесты
 
 ### Простой ответ

@@ -36,6 +36,10 @@ FastAPI-прокси между Open WebUI и docling-serve. Порт 5005. Prod
 ## ENV-переменные (минимум)
 
 - `ENRICH_PICTURES_WITH_122B` — true/false, обогащать ли картинки описаниями VLM в standard pipeline (default: true).
+- `TEXT_PDF_VLM_THRESHOLD` — N, страниц TEXT PDF ≤ N идут в VLM, иначе в standard. 0 → всегда standard (default: 20).
+- `SCAN_PDF_FULL_PAGE` — true/false, отправлять SCAN в VLM full-page или в standard (default: true).
+
+Все три параметра роутинга можно переопределить per-request через payload OWUI: `vlm_page_threshold`, `scan_pdf_full_page`. Подробно — раздел «PDF routing» в `README.md`.
 
 Полный список — `.env.example`. Ротация лог-файлов и retention для null/error/truncate-дампов — раздел «Logs and rotation» в `README.md`.
 
