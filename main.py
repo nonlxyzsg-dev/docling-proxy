@@ -35,21 +35,51 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-def _init_logging() -> logging.Logger:
+def _make_log_handler(include_logger_name: bool) -> logging.Handler:
+    """Один и тот же handler-фабричный конструктор для всех логгеров.
+
+    include_logger_name=True — добавляет `name:` (для uvicorn.access /
+    uvicorn.error, чтобы видеть откуда пришла строка). Для нашего
+    docling_proxy — без, чтобы не плодить шум в каждой строке.
+    """
     handler = logging.StreamHandler(sys.stdout)
     if _LOG_FORMAT == "json":
         handler.setFormatter(_JsonFormatter())
     else:
+        fmt = (
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            if include_logger_name
+            else "%(asctime)s [%(levelname)s] %(message)s"
+        )
         handler.setFormatter(logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+            fmt=fmt, datefmt="%Y-%m-%d %H:%M:%S",
         ))
+    return handler
+
+
+def _init_logging() -> logging.Logger:
     lg = logging.getLogger("docling_proxy")
     lg.handlers.clear()
-    lg.addHandler(handler)
+    lg.addHandler(_make_log_handler(include_logger_name=False))
     lg.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
     lg.propagate = False  # не дублируем в root/uvicorn
     return lg
+
+
+def _retrofit_uvicorn_loggers() -> None:
+    """Привести uvicorn-логи к общему формату прокси (timestamp + level + name).
+
+    uvicorn ставит свои handlers ПОСЛЕ импорта main.py (в Config.configure_logging),
+    поэтому делать это в module-level бесполезно — переопределение
+    вызывается из lifespan startup, когда uvicorn-конфиг уже применён.
+    """
+    handler = _make_log_handler(include_logger_name=True)
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.addHandler(handler)
+        lg.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+        lg.propagate = False
 
 
 logger = _init_logging()
@@ -519,6 +549,10 @@ def _stats_set(request: Request, **fields) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # uvicorn ставит свои handlers через Config.configure_logging() ПОСЛЕ
+    # импорта main.py — переопределяем здесь, к моменту первого запроса
+    # access/error логи уже идут через наш formatter с timestamp + level.
+    _retrofit_uvicorn_loggers()
     app.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(1200.0, connect=10.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -2227,11 +2261,39 @@ async def vlm_chat_completions(request: Request):
         VLM_FULL_PAGE_PROMPT if profile == "full_page" else VLM_PICTURE_DESC_PROMPT
     )
 
+    # Snapshot до инжекций — нужен для строки А, чтобы понять, какие
+    # ключи прокси добавил, а какие пришли от клиента.
+    client_keys = set(body.keys())
+    client_messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    client_had_system = any(
+        isinstance(m, dict) and m.get("role") == "system" for m in client_messages
+    )
+    msgs_count = len(client_messages)
+    has_image = any(
+        isinstance(c, dict) and c.get("type") == "image_url"
+        for m in client_messages if isinstance(m, dict)
+        for c in (m.get("content") if isinstance(m.get("content"), list) else [])
+    )
+
     _vlm_inject_sampling(body, sampling)
     _vlm_inject_system_prompt(body, sys_prompt)
     _vlm_inject_chat_template_kwargs(body)
 
     sampling_used = {k: body.get(k) for k in _VLM_OPENAI_SAMPLING_KEYS if k in body}
+
+    # Что именно прокси добавил (то, чего у клиента не было). max_tokens
+    # отдельно показан полем `max_tokens=N (source)`, поэтому в этот
+    # список не включается — иначе дублирование.
+    sampling_injected: list = [
+        k for k in sampling.keys()
+        if k != "max_tokens" and k not in client_keys
+    ]
+    mt_value = body.get("max_tokens") or body.get("max_completion_tokens")
+    mt_source = (
+        "client" if ("max_tokens" in client_keys or "max_completion_tokens" in client_keys)
+        else "default"
+    )
+    sys_source = "client" if client_had_system else "injected"
 
     request_id = str(uuid.uuid4())
     rid8 = request_id[:8]
@@ -2241,6 +2303,17 @@ async def vlm_chat_completions(request: Request):
         "Authorization": f"Bearer {VLM_UPSTREAM_API_KEY}",
         "X-Request-Id": request_id,
     }
+
+    # Строка А — приём, до форварда. При нагрузке даёт реалтайм-видимость
+    # того, что прокси отправляет в upstream (sampling, prompt, картинки),
+    # без необходимости ждать запись в JSONL.
+    logger.info(
+        f"[vlm rid={rid8}] received profile={profile} model={model} "
+        f"msgs={msgs_count} has_image={'true' if has_image else 'false'} "
+        f"max_tokens={mt_value if mt_value is not None else '-'} ({mt_source}) "
+        f"sampling_injected={','.join(sampling_injected) or '(none)'} "
+        f"system_prompt={sys_source}"
+    )
 
     client: httpx.AsyncClient = request.app.state.client
     _t = time.time()
@@ -2253,9 +2326,10 @@ async def vlm_chat_completions(request: Request):
         elapsed_ms = int((time.time() - _t) * 1000)
         err_type = _classify_error_type(exc, None)
         http_returned = 504 if "timeout" in err_type else 502
-        logger.warning(
-            f"[vlm rid={rid8}] upstream {err_type}: {type(exc).__name__}: {exc} "
-            f"after {elapsed_ms}ms"
+        logger.error(
+            f"[vlm rid={rid8}] upstream {http_returned} finish=- tokens=-/- "
+            f"elapsed={elapsed_ms}ms status=error "
+            f"msg=\"{err_type}: {type(exc).__name__}: {exc}\""
         )
         _vlm_log_request({
             "ts": dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
@@ -2321,7 +2395,14 @@ async def vlm_chat_completions(request: Request):
         "upstream_status": upstream_status,
     })
 
+    # Строка Б — ответ. WARNING при truncated, ERROR при upstream 4xx/5xx.
+    _ct = completion_tokens if completion_tokens is not None else "-"
+    _pt = prompt_tokens if prompt_tokens is not None else "-"
+    _fr = finish_reason if finish_reason is not None else "-"
     if status == "truncated":
+        dump_dir = os.path.join(
+            VLM_TRUNCATE_LOG_DIR, dt.utcnow().strftime("%Y-%m-%d"), request_id
+        )
         max_tokens_requested = body.get("max_tokens") or body.get("max_completion_tokens")
         # Дамп в фоне, чтобы не задерживать ответ клиенту.
         asyncio.create_task(asyncio.to_thread(
@@ -2337,9 +2418,26 @@ async def vlm_chat_completions(request: Request):
             sampling_used=sampling_used,
             max_tokens_requested=max_tokens_requested,
         ))
+        logger.warning(
+            f"[vlm rid={rid8}] upstream {upstream_status} finish=length "
+            f"tokens={_ct}/{_pt} elapsed={elapsed_ms}ms status=truncated "
+            f"dump_dir={dump_dir}"
+        )
+    elif status == "error":
+        # upstream вернул 4xx/5xx — текст ошибки берём из тела (если влезает).
+        try:
+            err_msg = upstream_resp.text[:200].replace("\n", " ").replace("\"", "'")
+        except Exception:
+            err_msg = ""
+        logger.error(
+            f"[vlm rid={rid8}] upstream {upstream_status} finish={_fr} "
+            f"tokens={_ct}/{_pt} elapsed={elapsed_ms}ms status=error "
+            f"msg=\"{err_msg}\""
+        )
+    else:
         logger.info(
-            f"[vlm rid={rid8}] truncated profile={profile} compl_tok={completion_tokens} "
-            f"elapsed={elapsed_ms}ms"
+            f"[vlm rid={rid8}] upstream {upstream_status} finish={_fr} "
+            f"tokens={_ct}/{_pt} elapsed={elapsed_ms}ms status=ok"
         )
 
     resp_headers = {"X-Request-ID": request_id}
