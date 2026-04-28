@@ -109,6 +109,37 @@ curl -sS http://10.121.3.201:5005/_stats/vlm?date=2026-04-28 | jq
 
 ---
 
+## Logs and rotation
+
+Прокси пишет четыре независимых потока логов на диск. У каждого свой retention в днях, у `vlm_requests_*.jsonl` дополнительно есть размерный cap. Чистка — раз в сутки в `lifespan` (плюс холостой проход при старте контейнера). Само логирование — append-only из hot path; ничего не блокируется.
+
+| Лог | Куда | Retention (ENV) | Размерный cap | Период чистки |
+|---|---|---|---|---|
+| `vlm_requests_<DATE>.jsonl` | каталог `${VLM_REQUEST_LOG_FILE}` | `VLM_REQUEST_LOG_RETENTION_DAYS=90` | `VLM_REQUEST_LOG_MAX_SIZE_MB=5120` (суммарно) | сутки |
+| `null_response_*.json` | `LOG_DIR` (`./logs`) | `NULL_RESPONSE_LOG_RETENTION_DAYS=30` | — | сутки |
+| `error_response_*.json` | `LOG_DIR` (`./logs`) | `ERROR_RESPONSE_LOG_RETENTION_DAYS=30` | — | сутки |
+| `truncated/<DATE>/<request_id>/` | `${VLM_TRUNCATE_LOG_DIR}` | `VLM_TRUNCATE_RETENTION_DAYS=30` | — | сутки |
+
+При старте в логах появляются строки:
+
+```
+[logs-cleanup] vlm_requests retention=90d size_cap=5120MB
+[logs-cleanup] null_responses retention=30d
+[logs-cleanup] error_responses retention=30d
+[logs-cleanup] truncate_dumps retention=30d
+```
+
+Размерный cap — страховка от переполнения диска, если поток запросов внезапно вырос. Удаление по cap'у логируется WARNING:
+
+```
+[logs-cleanup] vlm_requests size-cap: removed vlm_requests_2026-01-15.jsonl (614400 bytes, mtime=...)
+[logs-cleanup] vlm_requests size-cap: removed 2 file(s), freed 1228 MB (was 5320 MB, cap 5120 MB)
+```
+
+Чистка не трогает файлы с другим именем — ровно `vlm_requests_*.jsonl`, `null_response_*.json`, `error_response_*.json`. Каталоги truncate-дампов — по mtime директории.
+
+---
+
 ## Известные параметры (краткий перечень)
 
 Все ENV — в `.env.example`. Ключевое:

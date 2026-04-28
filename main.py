@@ -141,6 +141,15 @@ VLM_TRUNCATE_LOG_DIR = os.getenv("VLM_TRUNCATE_LOG_DIR", "./logs/truncated")
 VLM_TRUNCATE_SAVE_PAYLOAD = os.getenv("VLM_TRUNCATE_SAVE_PAYLOAD", "true").lower() == "true"
 VLM_TRUNCATE_RETENTION_DAYS = int(os.getenv("VLM_TRUNCATE_RETENTION_DAYS", "30"))
 
+# ── Retention для лог-файлов и диагностических дампов ──
+# Все пути крутятся в одном LOG_DIR (или каталоге VLM_REQUEST_LOG_FILE).
+# Retention в днях; vlm_requests_*.jsonl ещё ограничен размером
+# суммарно по каталогу — страховка от вечного роста счётчика.
+VLM_REQUEST_LOG_RETENTION_DAYS = int(os.getenv("VLM_REQUEST_LOG_RETENTION_DAYS", "90"))
+VLM_REQUEST_LOG_MAX_SIZE_MB = int(os.getenv("VLM_REQUEST_LOG_MAX_SIZE_MB", "5120"))
+NULL_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("NULL_RESPONSE_LOG_RETENTION_DAYS", "30"))
+ERROR_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("ERROR_RESPONSE_LOG_RETENTION_DAYS", "30"))
+
 
 def _load_sampling_profile(prefix: str) -> dict:
     """Собрать словарь sampling-параметров из ENV.
@@ -517,9 +526,12 @@ async def lifespan(app: FastAPI):
     )
     cleanup_old_inbox_files()
     cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
-    # Ротация null_response_*.json: при старте и раз в час.
+    # Ротация vlm_requests_*.jsonl + null/error response дампов: при
+    # старте и раз в сутки. Retention настраивается через ENV (см.
+    # *_RETENTION_DAYS), есть размерный cap для vlm_requests.
+    cleanup_old_vlm_request_logs()
     cleanup_old_null_response_logs()
-    null_cleanup_task = asyncio.create_task(_periodic_null_response_cleanup())
+    logs_cleanup_task = asyncio.create_task(_periodic_logs_cleanup())
     # Ротация truncate-дампов VLM endpoint'а: при старте и раз в сутки.
     cleanup_old_truncate_dumps()
     truncate_cleanup_task = asyncio.create_task(_periodic_truncate_dumps_cleanup())
@@ -531,6 +543,19 @@ async def lifespan(app: FastAPI):
         f"DEFAULT_IMAGES_SCALE={DEFAULT_IMAGES_SCALE}"
     )
     logger.info(f"[config] ENRICH_PICTURES_WITH_122B = {ENRICH_PICTURES_WITH_122B}")
+    logger.info(
+        f"[logs-cleanup] vlm_requests retention={VLM_REQUEST_LOG_RETENTION_DAYS}d"
+        f" size_cap={VLM_REQUEST_LOG_MAX_SIZE_MB}MB"
+    )
+    logger.info(
+        f"[logs-cleanup] null_responses retention={NULL_RESPONSE_LOG_RETENTION_DAYS}d"
+    )
+    logger.info(
+        f"[logs-cleanup] error_responses retention={ERROR_RESPONSE_LOG_RETENTION_DAYS}d"
+    )
+    logger.info(
+        f"[logs-cleanup] truncate_dumps retention={VLM_TRUNCATE_RETENTION_DAYS}d"
+    )
     # ── VLM endpoint конфиг (показываем без секретов) ──
     logger.info(
         f"[VLM-PROXY] enabled={VLM_PROXY_ENABLED} "
@@ -582,7 +607,7 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
-    null_cleanup_task.cancel()
+    logs_cleanup_task.cancel()
     truncate_cleanup_task.cancel()
 
     # Graceful shutdown stats: дать воркеру добить очередь в пределах 10с.
@@ -1330,33 +1355,122 @@ def _save_error_response_log(
         return ""
 
 
-def cleanup_old_null_response_logs(max_age_seconds: int = 7 * 86400) -> None:
-    """Удаляет файлы null_response_*.json и error_response_*.json старше max_age_seconds."""
-    if not os.path.isdir(LOG_DIR):
-        return
-    now = time.time()
+def _cleanup_files_by_mtime(directory: str, pattern: str, retention_days: int, label: str) -> int:
+    """Удалить файлы по glob-паттерну старше retention_days. Возвращает счётчик."""
+    if not os.path.isdir(directory):
+        return 0
+    if retention_days <= 0:
+        return 0
+    cutoff = time.time() - retention_days * 86400
     removed = 0
-    patterns = (_NULL_RESPONSE_LOG_PATTERN, _ERROR_RESPONSE_LOG_PATTERN)
-    for pattern in patterns:
-        for p in glob.glob(os.path.join(LOG_DIR, pattern)):
-            try:
-                if os.path.isfile(p) and (now - os.path.getmtime(p)) > max_age_seconds:
-                    os.remove(p)
-                    removed += 1
-            except Exception:
-                pass
+    for p in glob.glob(os.path.join(directory, pattern)):
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                removed += 1
+        except Exception as e:
+            logger.warning(f"[logs-cleanup] {label}: failed to remove {p}: {e}")
     if removed > 0:
-        logger.info(f"[diag-logs cleanup] removed {removed} old log(s)")
+        logger.info(
+            f"[logs-cleanup] {label}: removed {removed} file(s) older than {retention_days}d"
+        )
+    return removed
 
 
-async def _periodic_null_response_cleanup() -> None:
-    """Фоновая задача: чистить null_response_*.json и error_response_*.json раз в час."""
+def cleanup_old_null_response_logs() -> None:
+    """Чистит null_response_*.json и error_response_*.json по своему retention.
+
+    Имя сохранено для обратной совместимости с вызовом из lifespan на
+    старте контейнера — внутри теперь оба паттерна с независимыми
+    retention из ENV (NULL_RESPONSE_LOG_RETENTION_DAYS,
+    ERROR_RESPONSE_LOG_RETENTION_DAYS).
+    """
+    _cleanup_files_by_mtime(
+        LOG_DIR, _NULL_RESPONSE_LOG_PATTERN,
+        NULL_RESPONSE_LOG_RETENTION_DAYS, "null_responses",
+    )
+    _cleanup_files_by_mtime(
+        LOG_DIR, _ERROR_RESPONSE_LOG_PATTERN,
+        ERROR_RESPONSE_LOG_RETENTION_DAYS, "error_responses",
+    )
+
+
+_VLM_REQUEST_LOG_GLOB = "vlm_requests_*.jsonl"
+
+
+def cleanup_old_vlm_request_logs() -> None:
+    """Чистит vlm_requests_*.jsonl: по retention И по суммарному размеру.
+
+    Размерный лимит — страховка от вечного роста при коротком retention.
+    Если VLM_REQUEST_LOG_MAX_SIZE_MB > 0 и сумма больше — удаляются
+    самые старые до возврата под лимит, независимо от retention.
+    Каждое такое удаление логируется WARNING.
+    """
+    base_dir = os.path.dirname(VLM_REQUEST_LOG_FILE) or "."
+    if not os.path.isdir(base_dir):
+        return
+
+    # Шаг 1: retention.
+    _cleanup_files_by_mtime(
+        base_dir, _VLM_REQUEST_LOG_GLOB,
+        VLM_REQUEST_LOG_RETENTION_DAYS, "vlm_requests",
+    )
+
+    # Шаг 2: размерный cap.
+    if VLM_REQUEST_LOG_MAX_SIZE_MB <= 0:
+        return
+    cap_bytes = VLM_REQUEST_LOG_MAX_SIZE_MB * 1024 * 1024
+    files: list = []
+    for p in glob.glob(os.path.join(base_dir, _VLM_REQUEST_LOG_GLOB)):
+        try:
+            if os.path.isfile(p):
+                files.append((os.path.getmtime(p), os.path.getsize(p), p))
+        except Exception:
+            pass
+    total = sum(sz for _, sz, _ in files)
+    if total <= cap_bytes:
+        return
+    files.sort()  # по mtime, старые первые
+    removed_bytes = 0
+    removed_count = 0
+    for mtime, size, path in files:
+        if total - removed_bytes <= cap_bytes:
+            break
+        try:
+            os.remove(path)
+            removed_bytes += size
+            removed_count += 1
+            logger.warning(
+                f"[logs-cleanup] vlm_requests size-cap: removed {os.path.basename(path)} "
+                f"({size} bytes, mtime={dt.utcfromtimestamp(mtime).isoformat()}Z)"
+            )
+        except Exception as e:
+            logger.warning(f"[logs-cleanup] vlm_requests size-cap: remove failed {path}: {e}")
+    if removed_count > 0:
+        logger.warning(
+            f"[logs-cleanup] vlm_requests size-cap: removed {removed_count} file(s), "
+            f"freed {removed_bytes // (1024*1024)} MB "
+            f"(was {total // (1024*1024)} MB, cap {VLM_REQUEST_LOG_MAX_SIZE_MB} MB)"
+        )
+
+
+async def _periodic_logs_cleanup() -> None:
+    """Раз в сутки чистит все плоские лог-источники по их retention.
+
+    Каталог truncate-дампов чистится отдельной задачей
+    `_periodic_truncate_dumps_cleanup` — у него структура «каталог на
+    дату», логика другая (rmtree по mtime директории).
+    """
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(86400)
+        try:
+            cleanup_old_vlm_request_logs()
+        except Exception as e:
+            logger.error(f"[logs-cleanup] vlm_requests error: {e}")
         try:
             cleanup_old_null_response_logs()
         except Exception as e:
-            logger.error(f"[diag-logs cleanup] error: {e}")
+            logger.error(f"[logs-cleanup] null/error responses error: {e}")
 
 
 def fix_katex_compatibility(response_bytes: bytes) -> bytes:

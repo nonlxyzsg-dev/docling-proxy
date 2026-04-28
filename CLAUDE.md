@@ -37,7 +37,7 @@ FastAPI-прокси между Open WebUI и docling-serve. Порт 5005. Prod
 
 - `ENRICH_PICTURES_WITH_122B` — true/false, обогащать ли картинки описаниями VLM в standard pipeline (default: true).
 
-Полный список — `.env.example`.
+Полный список — `.env.example`. Ротация лог-файлов и retention для null/error/truncate-дампов — раздел «Logs and rotation» в `README.md`.
 
 ## VLM endpoint (v4.x)
 
