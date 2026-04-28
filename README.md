@@ -115,6 +115,7 @@ curl -sS http://10.121.3.201:5005/_stats/vlm?date=2026-04-28 | jq
 
 | ENV | Назначение |
 |---|---|
+| `ENRICH_PICTURES_WITH_122B` | true/false, обогащать ли картинки описаниями VLM в standard pipeline (default: `true`). |
 | `VLM_PROXY_ENABLED` | Главный флаг. `false` → docling-serve ходит мимо прокси (старое поведение). `true` → через прокси. |
 | `VLM_PROXY_URL` | Self-reference, инжектируется в конфиги docling-serve. |
 | `VLM_UPSTREAM_URL` / `VLM_UPSTREAM_API_KEY` | Куда форвардит прокси. Если пусто — берётся `DEFAULT_VLM_URL`/`DEFAULT_VLM_API_KEY`. |

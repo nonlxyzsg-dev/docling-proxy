@@ -54,6 +54,24 @@ def _init_logging() -> logging.Logger:
 
 logger = _init_logging()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Парсер булевых ENV: true/1/yes/on → True, false/0/no/off/"" → False.
+
+    Регистронезависимо. Неизвестное значение → default + warning. Цель —
+    явные дефолты вместо «как парсит os.getenv».
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = raw.strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off", ""):
+        return False
+    logger.warning(f"[config] {name}={raw!r} not a boolean, using default={default}")
+    return default
+
 # ═══════════════════════════════════════════════════════════════
 # Глобальные переменные из .env
 # ═══════════════════════════════════════════════════════════════
@@ -75,7 +93,7 @@ OCR_SDK_URL = os.getenv("OCR_SDK_URL", "http://10.121.3.201:9996")
 OCR_SDK_INBOX_CONTAINER = os.getenv("OCR_SDK_INBOX_CONTAINER", "/inbox")
 OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
 OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
-ENRICH_PICTURES_WITH_122B = os.getenv("ENRICH_PICTURES_WITH_122B", "true").lower() == "true"
+ENRICH_PICTURES_WITH_122B = _env_bool("ENRICH_PICTURES_WITH_122B", default=True)
 
 # ── Маршрутизация и качество рендеринга (настраивается из .env, override per-request через form-data) ──
 # Порог страниц для TEXT PDF: <=порога → VLM full-page, >порога → standard+picture_description.
@@ -512,6 +530,7 @@ async def lifespan(app: FastAPI):
         f"DEFAULT_VLM_SCALE={DEFAULT_VLM_SCALE}, "
         f"DEFAULT_IMAGES_SCALE={DEFAULT_IMAGES_SCALE}"
     )
+    logger.info(f"[config] ENRICH_PICTURES_WITH_122B = {ENRICH_PICTURES_WITH_122B}")
     # ── VLM endpoint конфиг (показываем без секретов) ──
     logger.info(
         f"[VLM-PROXY] enabled={VLM_PROXY_ENABLED} "

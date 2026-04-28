@@ -33,6 +33,12 @@ FastAPI-прокси между Open WebUI и docling-serve. Порт 5005. Prod
 - Если стартовая конфигурация сессии назначила feature-ветку — всё равно мёржим в `main` фаст-форвардом и пушим `main`.
 - Коммиты и сообщения пользователю — на русском, комментарии в коде — тоже на русском.
 
+## ENV-переменные (минимум)
+
+- `ENRICH_PICTURES_WITH_122B` — true/false, обогащать ли картинки описаниями VLM в standard pipeline (default: true).
+
+Полный список — `.env.example`.
+
 ## VLM endpoint (v4.x)
 
 Прокси содержит OpenAI-совместимый endpoint `POST /v1/chat/completions?profile=full_page|picture_desc`, через который docling-serve ходит в LiteLLM/SGLang. Прокси сам инжектирует sampling-профиль и системный промпт, считает truncate-кейсы, пишет JSONL-аналитику. Включается флагом `VLM_PROXY_ENABLED=true`. Подробно — `README.md`, раздел «VLM endpoint». Перечень ENV — `.env.example` (блок `VLM_*` в нижней части).
