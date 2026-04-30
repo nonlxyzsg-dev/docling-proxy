@@ -6,9 +6,12 @@ from proxy.config import (
     VLM_FULL_PAGE_SAMPLING, VLM_PICTURE_DESC_SAMPLING,
     VLM_UPSTREAM_URL, VLM_UPSTREAM_API_KEY,
     VLM_REQUEST_LOG_FILE, VLM_TRUNCATE_LOG_DIR, VLM_TRUNCATE_SAVE_PAYLOAD,
+    VLM_FULL_PAGE_TARGET_PIXELS, VLM_PICTURE_DESC_TARGET_PIXELS,
+    VLM_MIN_PIXELS, VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES,
 )
 from proxy.prompts import VLM_FULL_PAGE_PROMPT, VLM_PICTURE_DESC_PROMPT
 from proxy.error_handling import _classify_error_type
+from proxy.image_resize import resize_images_in_messages, summarize_resize_stats
 
 logger = logging.getLogger("docling_proxy")
 
@@ -17,6 +20,37 @@ _VLM_OPENAI_SAMPLING_KEYS = {
     "presence_penalty", "frequency_penalty", "repetition_penalty",
     "max_tokens", "max_completion_tokens",
 }
+
+
+def _pick_target_pixels(profile: str) -> int:
+    if profile == "full_page":
+        return VLM_FULL_PAGE_TARGET_PIXELS
+    if profile == "picture_desc":
+        return VLM_PICTURE_DESC_TARGET_PIXELS
+    return 0
+
+
+def _snapshot_image_urls(messages: list) -> list:
+    """Collect data:URLs from messages[].content[] before resize, in order."""
+    out = []
+    if not isinstance(messages, list):
+        return out
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if not isinstance(c, dict) or c.get("type") != "image_url":
+                continue
+            iu = c.get("image_url")
+            if not isinstance(iu, dict):
+                continue
+            url = iu.get("url", "")
+            if isinstance(url, str) and url.startswith("data:"):
+                out.append(url)
+    return out
 
 
 def _vlm_request_log_path_for(date_str: str) -> str:
@@ -78,6 +112,22 @@ def _vlm_strip_images_in_place(body: dict, save_to_dir: "str | None") -> int:
     return count
 
 
+def _save_original_images(out_dir: str, original_urls: list) -> int:
+    """Save pre-resize originals as page_<i>_original.png. Returns count."""
+    if not original_urls:
+        return 0
+    count = 0
+    for i, url in enumerate(original_urls):
+        try:
+            _, b64 = url.split(",", 1)
+            with open(os.path.join(out_dir, f"page_{i}_original.png"), "wb") as f:
+                f.write(base64.b64decode(b64))
+            count += 1
+        except Exception as e:
+            logger.warning(f"[vlm-truncate-dump] original image {i} save failed: {e}")
+    return count
+
+
 def _vlm_save_truncate_dump(
     *,
     request_id: str,
@@ -90,6 +140,8 @@ def _vlm_save_truncate_dump(
     elapsed_ms: int,
     sampling_used: dict,
     max_tokens_requested,
+    image_resize_stats: dict | None = None,
+    original_image_urls: list | None = None,
 ) -> None:
     """Синхронный дамп truncate-кейса."""
     try:
@@ -115,6 +167,8 @@ def _vlm_save_truncate_dump(
                         json.dump(response_data, f, ensure_ascii=False, indent=2)
                 except Exception as e:
                     logger.error(f"[vlm-truncate-dump] response.json failed: {e}")
+            if VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES and original_image_urls:
+                _save_original_images(out_dir, original_image_urls)
         else:
             _vlm_strip_images_in_place(body_clean, None)
 
@@ -132,6 +186,8 @@ def _vlm_save_truncate_dump(
             "sampling_params_used": sampling_used,
             "save_payload": VLM_TRUNCATE_SAVE_PAYLOAD,
         }
+        if image_resize_stats:
+            meta["image_resize"] = image_resize_stats
         try:
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -242,6 +298,9 @@ async def vlm_chat_completions(request: Request):
         VLM_FULL_PAGE_PROMPT if profile == "full_page" else VLM_PICTURE_DESC_PROMPT
     )
 
+    request_id = str(uuid.uuid4())
+    rid8 = request_id[:8]
+
     client_keys = set(body.keys())
     client_messages = body.get("messages") if isinstance(body.get("messages"), list) else []
     client_had_system = any(
@@ -253,6 +312,35 @@ async def vlm_chat_completions(request: Request):
         for m in client_messages if isinstance(m, dict)
         for c in (m.get("content") if isinstance(m.get("content"), list) else [])
     )
+
+    # ── Adaptive image resize (in-place on body.messages) ──
+    # Keep a snapshot of pre-resize data:URLs only when truncate-dump origin
+    # saving is enabled — otherwise we'd carry MBs of base64 around for nothing.
+    target_pixels = _pick_target_pixels(profile)
+    original_image_urls: list | None = None
+    if VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES and has_image:
+        original_image_urls = _snapshot_image_urls(client_messages)
+    image_resize_stats: dict = {}
+    if has_image and target_pixels > 0:
+        _t_resize = time.time()
+        agg = await asyncio.to_thread(
+            resize_images_in_messages,
+            client_messages, target_pixels, VLM_MIN_PIXELS,
+        )
+        _resize_ms = int((time.time() - _t_resize) * 1000)
+        image_resize_stats = summarize_resize_stats(agg)
+        if image_resize_stats:
+            was_arr = agg.get("was_pixels") or []
+            new_arr = agg.get("new_pixels") or []
+            image_resize_stats["elapsed_ms"] = _resize_ms
+            image_resize_stats["target_pixels"] = target_pixels
+            logger.info(
+                f"[vlm rid={rid8}] image_resize profile={profile} "
+                f"imgs={image_resize_stats['imgs']} "
+                f"resized={image_resize_stats['resized']} "
+                f"was={was_arr} new={new_arr} "
+                f"elapsed={_resize_ms}ms"
+            )
 
     _vlm_inject_sampling(body, sampling)
     _vlm_inject_system_prompt(body, sys_prompt)
@@ -271,8 +359,6 @@ async def vlm_chat_completions(request: Request):
     )
     sys_source = "client" if client_had_system else "injected"
 
-    request_id = str(uuid.uuid4())
-    rid8 = request_id[:8]
     model = body.get("model", "")
     headers = {
         "Content-Type": "application/json",
@@ -304,7 +390,7 @@ async def vlm_chat_completions(request: Request):
             f"elapsed={elapsed_ms}ms status=error "
             f"msg=\"{err_type}: {type(exc).__name__}: {exc}\""
         )
-        _vlm_log_request({
+        _err_record = {
             "ts": dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
             "request_id": request_id,
             "profile": profile,
@@ -315,7 +401,10 @@ async def vlm_chat_completions(request: Request):
             "elapsed_ms": elapsed_ms,
             "status": "error",
             "error": f"{err_type}: {type(exc).__name__}",
-        })
+        }
+        if image_resize_stats:
+            _err_record["image_resize"] = image_resize_stats
+        _vlm_log_request(_err_record)
         return Response(
             content=json.dumps(
                 {"error": {"message": f"upstream {err_type}",
@@ -355,7 +444,7 @@ async def vlm_chat_completions(request: Request):
     else:
         status = "ok"
 
-    _vlm_log_request({
+    _ok_record = {
         "ts": dt.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
         "request_id": request_id,
         "profile": profile,
@@ -366,7 +455,10 @@ async def vlm_chat_completions(request: Request):
         "elapsed_ms": elapsed_ms,
         "status": status,
         "upstream_status": upstream_status,
-    })
+    }
+    if image_resize_stats:
+        _ok_record["image_resize"] = image_resize_stats
+    _vlm_log_request(_ok_record)
 
     _ct = completion_tokens if completion_tokens is not None else "-"
     _pt = prompt_tokens if prompt_tokens is not None else "-"
@@ -388,6 +480,8 @@ async def vlm_chat_completions(request: Request):
             elapsed_ms=elapsed_ms,
             sampling_used=sampling_used,
             max_tokens_requested=max_tokens_requested,
+            image_resize_stats=image_resize_stats or None,
+            original_image_urls=original_image_urls,
         ))
         logger.warning(
             f"[vlm rid={rid8}] upstream {upstream_status} finish=length "

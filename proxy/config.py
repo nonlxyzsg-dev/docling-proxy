@@ -64,6 +64,21 @@ def _resolve_bool_flag(payload_value, env_value: bool, env_source: str, name: st
         f"[rid={rid8}] {name}={s!r} not a boolean, fallback to env"
     )
     return env_value, env_source
+
+
+def _env_int_or_zero(name: str, default: str) -> int:
+    """Parse non-negative int env. Empty/'0'/invalid -> 0 (= disabled)."""
+    raw = os.getenv(name, default).strip()
+    if raw == "":
+        return 0
+    try:
+        v = int(raw)
+        return v if v >= 0 else 0
+    except (TypeError, ValueError):
+        logger.warning(f"[config] {name}={raw!r} not a valid int, using 0 (disabled)")
+        return 0
+
+
 LOG_DIR = "./logs"
 
 DOCLING_URL = os.getenv("DOCLING_URL")
@@ -144,13 +159,28 @@ VLM_TRUNCATE_SAVE_PAYLOAD = os.getenv("VLM_TRUNCATE_SAVE_PAYLOAD", "true").lower
 VLM_TRUNCATE_RETENTION_DAYS = int(os.getenv("VLM_TRUNCATE_RETENTION_DAYS", "30"))
 
 # ── Retention для лог-файлов и диагностических дампов ──
-# Все пути крутятся в одном LOG_DIR (или каталоге VLM_REQUEST_LOG_FILE).
-# Retention в днях; vlm_requests_*.jsonl ещё ограничен размером
-# суммарно по каталогу — страховка от вечного роста счётчика.
 VLM_REQUEST_LOG_RETENTION_DAYS = int(os.getenv("VLM_REQUEST_LOG_RETENTION_DAYS", "90"))
 VLM_REQUEST_LOG_MAX_SIZE_MB = int(os.getenv("VLM_REQUEST_LOG_MAX_SIZE_MB", "5120"))
 NULL_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("NULL_RESPONSE_LOG_RETENTION_DAYS", "30"))
 ERROR_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("ERROR_RESPONSE_LOG_RETENTION_DAYS", "30"))
+
+
+# ── Adaptive image resize before upstream forward ──
+# Каждое изображение в payload /v1/chat/completions перед форвардом в LiteLLM/SGLang
+# приводится к target_pixels (по площади, с сохранением aspect ratio через LANCZOS).
+# Маленькие изображения (< VLM_MIN_PIXELS) проходят без изменений — модель сама
+# апскейлит до своих минимумов. 0 или пусто = ресайз отключён для профиля.
+# Эмпирический оптимум для Qwen3.5-VL-122B — 950000 px (см. отчёт «Устранение
+# лупов» 25.04.2026, раздел 5).
+VLM_FULL_PAGE_TARGET_PIXELS = _env_int_or_zero("VLM_FULL_PAGE_TARGET_PIXELS", "950000")
+VLM_PICTURE_DESC_TARGET_PIXELS = _env_int_or_zero("VLM_PICTURE_DESC_TARGET_PIXELS", "950000")
+VLM_MIN_PIXELS = int(os.getenv("VLM_MIN_PIXELS", "200704"))
+
+# Опционально: при truncate-дампе сохранять и оригинал картинки (до ресайза)
+# рядом с фактически отправленной — для разбора.
+VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES = _env_bool("VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES", default=False)
+
+
 def _load_sampling_profile(prefix: str) -> dict:
     """Собрать словарь sampling-параметров из ENV.
 

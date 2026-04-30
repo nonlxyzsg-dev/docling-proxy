@@ -47,6 +47,19 @@ FastAPI-прокси между Open WebUI и docling-serve. Порт 5005. Prod
 
 Прокси содержит OpenAI-совместимый endpoint `POST /v1/chat/completions?profile=full_page|picture_desc`, через который docling-serve ходит в LiteLLM/SGLang. Прокси сам инжектирует sampling-профиль и системный промпт, считает truncate-кейсы, пишет JSONL-аналитику. Включается флагом `VLM_PROXY_ENABLED=true`. Подробно — `README.md`, раздел «VLM endpoint». Перечень ENV — `.env.example` (блок `VLM_*` в нижней части).
 
+## Image resize (Phase 2)
+
+Перед форвардом каждого `/v1/chat/completions` запроса в LiteLLM/SGLang прокси адаптивно ресайзит картинки в payload до целевой площади `target_pixels` (per-profile, default 950000 px). Логика — `proxy/image_resize.py` (чистый helper) + интеграция в `proxy/vlm_endpoint.py` (`asyncio.to_thread` для PIL-операций, не блокирует event loop).
+
+- Картинки `was_px > target_pixels` → LANCZOS-downscale, aspect сохраняется, PNG re-encode.
+- `was_px < VLM_MIN_PIXELS` (default 200704) → без изменений: модель сама апскейлит.
+- В диапазоне → без изменений (`reason=in_range`).
+- Errors → passthrough, не падает.
+
+ENV: `VLM_FULL_PAGE_TARGET_PIXELS`, `VLM_PICTURE_DESC_TARGET_PIXELS`, `VLM_MIN_PIXELS`, `VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES`. `0` или пусто = ресайз отключён для профиля. Подробно — `README.md` раздел «Image resize».
+
+Логирование: одна INFO-строка `[vlm rid=...] image_resize profile=... imgs=N resized=M was=[...] new=[...]` на запрос (если хоть одна inline-картинка). Поле `image_resize` в JSONL `vlm_requests_*.jsonl` и в `meta.json` truncate-дампа.
+
 ## Долгосрочно
 
 Когда форк docling решит проблемы, которые сейчас обходит прокси:
