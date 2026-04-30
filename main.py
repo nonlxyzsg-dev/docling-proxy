@@ -17,6 +17,8 @@ from proxy.config import (
     VLM_TRUNCATE_SAVE_PAYLOAD,
     VLM_PROXY_ENABLED, VLM_PROXY_URL, VLM_UPSTREAM_URL,
     VLM_FULL_PAGE_SAMPLING, VLM_PICTURE_DESC_SAMPLING,
+    VLM_FULL_PAGE_TARGET_PIXELS, VLM_PICTURE_DESC_TARGET_PIXELS,
+    VLM_MIN_PIXELS, VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES,
     STATS_ENABLED, STATS_DB_DSN, STATS_QUEUE_SIZE,
     STATS_BATCH_SIZE, STATS_FLUSH_INTERVAL_SEC,
 )
@@ -37,6 +39,10 @@ from proxy.vlm_endpoint import router as vlm_router
 from proxy.proxy_handler import router as proxy_router
 
 logger = logging.getLogger("docling_proxy")
+
+
+def _fmt_target_pixels(value: int) -> str:
+    return str(value) if value and value > 0 else "disabled"
 
 
 @asynccontextmanager
@@ -75,15 +81,20 @@ async def lifespan(app: FastAPI):
         f"upstream={VLM_UPSTREAM_URL} "
         f"truncate_dir={VLM_TRUNCATE_LOG_DIR} "
         f"save_payload={VLM_TRUNCATE_SAVE_PAYLOAD} "
+        f"save_original_images={VLM_TRUNCATE_SAVE_ORIGINAL_IMAGES} "
         f"retention_days={VLM_TRUNCATE_RETENTION_DAYS}"
     )
     logger.info(
         f"[VLM-PROXY] full_page sampling={VLM_FULL_PAGE_SAMPLING} "
-        f"prompt_chars={len(VLM_FULL_PAGE_PROMPT)}"
+        f"prompt_chars={len(VLM_FULL_PAGE_PROMPT)} "
+        f"target_pixels={_fmt_target_pixels(VLM_FULL_PAGE_TARGET_PIXELS)} "
+        f"min_pixels={VLM_MIN_PIXELS}"
     )
     logger.info(
         f"[VLM-PROXY] picture_desc sampling={VLM_PICTURE_DESC_SAMPLING} "
-        f"prompt_chars={len(VLM_PICTURE_DESC_PROMPT)}"
+        f"prompt_chars={len(VLM_PICTURE_DESC_PROMPT)} "
+        f"target_pixels={_fmt_target_pixels(VLM_PICTURE_DESC_TARGET_PIXELS)} "
+        f"min_pixels={VLM_MIN_PIXELS}"
     )
 
     app.state.stats_pool = None
