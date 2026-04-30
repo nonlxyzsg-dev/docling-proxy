@@ -23,6 +23,35 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Безопасный int ENV. Отсутствие / пустая строка / invalid → default + WARNING.
+
+    Используем для всех int-ENV — особенно когда переменная пробрасывается через
+    docker-compose `${VAR}` без значения в `.env` (там Docker подставляет пустую
+    строку, и os.getenv(..., default) возвращает '' вместо default → int('') → ValueError).
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning(f"[config] {name}={raw!r} not a valid int, using default={default}")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Безопасный float ENV. Отсутствие / пустая строка / invalid → default + WARNING."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning(f"[config] {name}={raw!r} not a valid float, using default={default}")
+        return default
+
+
 def _resolve_int_threshold(payload_value, env_value: int, env_source: str, name: str, rid8: str):
     """Резолв payload > env > default для целочисленных параметров.
 
@@ -67,7 +96,13 @@ def _resolve_bool_flag(payload_value, env_value: bool, env_source: str, name: st
 
 
 def _env_int_or_zero(name: str, default: str) -> int:
-    """Parse non-negative int env. Empty/'0'/invalid -> 0 (= disabled)."""
+    """Parse non-negative int env. Empty/'0'/invalid -> 0 (= disabled).
+
+    Особая семантика: 0 означает «функционал отключён» (используется для
+    target_pixels). Для обычных int-ENV (timeout/retention/queue/batch и т.п.)
+    предпочитайте _env_int(name, default) — он возвращает явный default при
+    пустой строке, а не 0.
+    """
     raw = os.getenv(name, default).strip()
     if raw == "":
         return 0
@@ -90,52 +125,49 @@ DEFAULT_VLM_MODEL = os.getenv("DEFAULT_VLM_MODEL")
 DEFAULT_VLM_TIMEOUT = os.getenv("DEFAULT_VLM_TIMEOUT")
 DEFAULT_VLM_CONCURRENCY = os.getenv("DEFAULT_VLM_CONCURRENCY")
 DEFAULT_VLM_MAX_CONCURRENT_DOCS = os.getenv("DEFAULT_VLM_MAX_CONCURRENT_DOCS", "2")
-DEFAULT_VLM_MAX_COMPLETION_TOKENS = int(os.getenv("DEFAULT_VLM_MAX_COMPLETION_TOKENS", "2048"))
+DEFAULT_VLM_MAX_COMPLETION_TOKENS = _env_int("DEFAULT_VLM_MAX_COMPLETION_TOKENS", 2048)
 
 # ── OCR SDK интеграция (v4.0) ──
 OCR_SDK_URL = os.getenv("OCR_SDK_URL", "http://10.121.3.201:9996")
 OCR_SDK_INBOX_CONTAINER = os.getenv("OCR_SDK_INBOX_CONTAINER", "/inbox")
-OCR_SDK_ENABLED = os.getenv("OCR_SDK_ENABLED", "false").lower() == "true"
-OCR_SDK_TIMEOUT = int(os.getenv("OCR_SDK_TIMEOUT", "600"))
+OCR_SDK_ENABLED = _env_bool("OCR_SDK_ENABLED", default=False)
+OCR_SDK_TIMEOUT = _env_int("OCR_SDK_TIMEOUT", 600)
 ENRICH_PICTURES_WITH_122B = _env_bool("ENRICH_PICTURES_WITH_122B", default=True)
 
 # ── Маршрутизация и качество рендеринга (настраивается из .env, override per-request через form-data) ──
 # Порог страниц для TEXT PDF: <=порога → VLM full-page, >порога → standard+picture_description.
 # 0 → TEXT PDF никогда не идёт в VLM (всегда standard).
 _TEXT_PDF_VLM_THRESHOLD_DEFAULT = 20
-TEXT_PDF_VLM_THRESHOLD = int(
-    os.environ.get("TEXT_PDF_VLM_THRESHOLD")
-    or _TEXT_PDF_VLM_THRESHOLD_DEFAULT
-)
-TEXT_PDF_VLM_THRESHOLD_SOURCE = "env" if os.environ.get("TEXT_PDF_VLM_THRESHOLD") else "default"
+TEXT_PDF_VLM_THRESHOLD = _env_int("TEXT_PDF_VLM_THRESHOLD", _TEXT_PDF_VLM_THRESHOLD_DEFAULT)
+TEXT_PDF_VLM_THRESHOLD_SOURCE = "env" if (os.environ.get("TEXT_PDF_VLM_THRESHOLD") or "").strip() else "default"
 
 # Отправлять ли SCAN PDF в VLM full-page. False → SCAN идёт в standard
 # pipeline (docling сам OCR'ит и режет на полигоны через picture
 # description). По умолчанию True — VLM качественнее на сканах.
 _SCAN_PDF_FULL_PAGE_DEFAULT = True
 SCAN_PDF_FULL_PAGE = _env_bool("SCAN_PDF_FULL_PAGE", default=_SCAN_PDF_FULL_PAGE_DEFAULT)
-SCAN_PDF_FULL_PAGE_SOURCE = "env" if os.environ.get("SCAN_PDF_FULL_PAGE") else "default"
+SCAN_PDF_FULL_PAGE_SOURCE = "env" if (os.environ.get("SCAN_PDF_FULL_PAGE") or "").strip() else "default"
 # scale для VLM-пайплайнов (build_vlm_pipeline_model_api и build_custom_model).
-DEFAULT_VLM_SCALE = float(os.environ.get("DEFAULT_VLM_SCALE", "1.5"))
+DEFAULT_VLM_SCALE = _env_float("DEFAULT_VLM_SCALE", 1.5)
 # images_scale для standard-пайплайна: реально влияет на разрешение картинок,
 # отправляемых в picture_description_api. Linear: 1.0 ≈ 36 DPI, 2.0 ≈ 96 DPI (A4).
-DEFAULT_IMAGES_SCALE = float(os.environ.get("DEFAULT_IMAGES_SCALE", "2.0"))
+DEFAULT_IMAGES_SCALE = _env_float("DEFAULT_IMAGES_SCALE", 2.0)
 
 # ── PostgreSQL-статистика (fire-and-forget, не влияет на latency) ──
 # При STATS_ENABLED=false весь блок выключен: очередь/пул/worker не создаются,
 # накладных расходов ноль (см. README-STATS.md).
-STATS_ENABLED = os.getenv("STATS_ENABLED", "false").lower() == "true"
+STATS_ENABLED = _env_bool("STATS_ENABLED", default=False)
 STATS_DB_DSN = os.getenv("STATS_DB_DSN", "")
-STATS_QUEUE_SIZE = int(os.getenv("STATS_QUEUE_SIZE", "10000"))
-STATS_BATCH_SIZE = int(os.getenv("STATS_BATCH_SIZE", "50"))
-STATS_FLUSH_INTERVAL_SEC = float(os.getenv("STATS_FLUSH_INTERVAL_SEC", "5"))
+STATS_QUEUE_SIZE = _env_int("STATS_QUEUE_SIZE", 10000)
+STATS_BATCH_SIZE = _env_int("STATS_BATCH_SIZE", 50)
+STATS_FLUSH_INTERVAL_SEC = _env_float("STATS_FLUSH_INTERVAL_SEC", 5.0)
 
 # ── Retry на upstream-сбои docling (только httpx-исключения и 502/503/504) ──
 # Не ретраим 500, 4xx и partial_success: первое часто воспроизводимо, последнее
 # держит семафор впустую. Retry проходит ВНУТРИ семафора, чтобы общий cap
 # vlm_max_concurrent_docs не пробивался.
-DOCLING_RETRY_MAX_ATTEMPTS = int(os.getenv("DOCLING_RETRY_MAX_ATTEMPTS", "2"))
-DOCLING_RETRY_BACKOFF_SEC = float(os.getenv("DOCLING_RETRY_BACKOFF_SEC", "1.0"))
+DOCLING_RETRY_MAX_ATTEMPTS = _env_int("DOCLING_RETRY_MAX_ATTEMPTS", 2)
+DOCLING_RETRY_BACKOFF_SEC = _env_float("DOCLING_RETRY_BACKOFF_SEC", 1.0)
 
 # ── VLM proxy gateway (sampling injection + truncate analytics) ──
 # Прокси выступает gateway'ем между docling-serve и LiteLLM/SGLang. Когда
@@ -144,7 +176,7 @@ DOCLING_RETRY_BACKOFF_SEC = float(os.getenv("DOCLING_RETRY_BACKOFF_SEC", "1.0"))
 # Прокси добавляет sampling-параметры из соответствующего профиля,
 # системный промпт, считает truncate-кейсы и форвардит в upstream
 # (LiteLLM). Подробнее — README.md, раздел «VLM endpoint».
-VLM_PROXY_ENABLED = os.getenv("VLM_PROXY_ENABLED", "false").lower() == "true"
+VLM_PROXY_ENABLED = _env_bool("VLM_PROXY_ENABLED", default=False)
 VLM_PROXY_URL = os.getenv("VLM_PROXY_URL", "").strip()
 # Upstream для самого прокси. Backwards-compat: если VLM_UPSTREAM_URL не
 # задан — используем DEFAULT_VLM_URL/DEFAULT_VLM_API_KEY (LiteLLM).
@@ -155,14 +187,14 @@ VLM_UPSTREAM_API_KEY = (
 
 VLM_REQUEST_LOG_FILE = os.getenv("VLM_REQUEST_LOG_FILE", "./logs/vlm_requests.jsonl")
 VLM_TRUNCATE_LOG_DIR = os.getenv("VLM_TRUNCATE_LOG_DIR", "./logs/truncated")
-VLM_TRUNCATE_SAVE_PAYLOAD = os.getenv("VLM_TRUNCATE_SAVE_PAYLOAD", "true").lower() == "true"
-VLM_TRUNCATE_RETENTION_DAYS = int(os.getenv("VLM_TRUNCATE_RETENTION_DAYS", "30"))
+VLM_TRUNCATE_SAVE_PAYLOAD = _env_bool("VLM_TRUNCATE_SAVE_PAYLOAD", default=True)
+VLM_TRUNCATE_RETENTION_DAYS = _env_int("VLM_TRUNCATE_RETENTION_DAYS", 30)
 
 # ── Retention для лог-файлов и диагностических дампов ──
-VLM_REQUEST_LOG_RETENTION_DAYS = int(os.getenv("VLM_REQUEST_LOG_RETENTION_DAYS", "90"))
-VLM_REQUEST_LOG_MAX_SIZE_MB = int(os.getenv("VLM_REQUEST_LOG_MAX_SIZE_MB", "5120"))
-NULL_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("NULL_RESPONSE_LOG_RETENTION_DAYS", "30"))
-ERROR_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("ERROR_RESPONSE_LOG_RETENTION_DAYS", "30"))
+VLM_REQUEST_LOG_RETENTION_DAYS = _env_int("VLM_REQUEST_LOG_RETENTION_DAYS", 90)
+VLM_REQUEST_LOG_MAX_SIZE_MB = _env_int("VLM_REQUEST_LOG_MAX_SIZE_MB", 5120)
+NULL_RESPONSE_LOG_RETENTION_DAYS = _env_int("NULL_RESPONSE_LOG_RETENTION_DAYS", 30)
+ERROR_RESPONSE_LOG_RETENTION_DAYS = _env_int("ERROR_RESPONSE_LOG_RETENTION_DAYS", 30)
 
 
 # ── Adaptive image resize before upstream forward ──
@@ -172,9 +204,14 @@ ERROR_RESPONSE_LOG_RETENTION_DAYS = int(os.getenv("ERROR_RESPONSE_LOG_RETENTION_
 # апскейлит до своих минимумов. 0 или пусто = ресайз отключён для профиля.
 # Эмпирический оптимум для Qwen3.5-VL-122B — 950000 px (см. отчёт «Устранение
 # лупов» 25.04.2026, раздел 5).
+#
+# Используем _env_int_or_zero — у target_pixels особая семантика: 0=disabled
+# (а не «как пишет код»). Для VLM_MIN_PIXELS — обычный _env_int с явным
+# default'ом, иначе при пустой строке min_pixels превратится в 0 и ресайзить
+# начнёт даже крошечные иконки.
 VLM_FULL_PAGE_TARGET_PIXELS = _env_int_or_zero("VLM_FULL_PAGE_TARGET_PIXELS", "950000")
 VLM_PICTURE_DESC_TARGET_PIXELS = _env_int_or_zero("VLM_PICTURE_DESC_TARGET_PIXELS", "950000")
-VLM_MIN_PIXELS = int(os.getenv("VLM_MIN_PIXELS", "200704"))
+VLM_MIN_PIXELS = _env_int("VLM_MIN_PIXELS", 200704)
 
 # Опционально: при truncate-дампе сохранять и оригинал картинки (до ресайза)
 # рядом с фактически отправленной — для разбора.

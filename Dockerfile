@@ -1,4 +1,10 @@
-FROM ghcr.io/docling-project/docling-serve:main
+# Базовый образ docling-serve, запинен по digest для воспроизводимости
+# и защиты от silent breaking changes в upstream.
+# Чтобы обновить — выполнить:
+#   docker pull ghcr.io/docling-project/docling-serve:main
+#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/docling-project/docling-serve:main
+# и обновить хэш ниже + проверить acceptance-тесты.
+FROM ghcr.io/docling-project/docling-serve@sha256:00135f1e84a925d898de02ea493f7582175d959c560bf0af27d48ad9f199c8dd
 WORKDIR /proxy
 
 # stdout/stderr небуферизованные — иначе строки логов могут не появиться
