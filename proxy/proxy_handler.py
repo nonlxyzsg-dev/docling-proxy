@@ -78,6 +78,37 @@ async def proxy(request: Request, path: str):
             else:
                 data.append((key, str(field)))
 
+        # proxy_skip: клиент явно говорит «не обрабатывай файл, в docling не ходи».
+        # Принимаем truthy-значения (true/1/yes/on), сам параметр в docling не пробрасываем.
+        # Ответ — стандартный docling-формат с пустым md_content, чтобы OWUI не ломался.
+        _proxy_skip_raw = ""
+        for _k, _v in data:
+            if _k == "proxy_skip":
+                _proxy_skip_raw = _v
+                break
+        data = [(k, v) for k, v in data if k != "proxy_skip"]
+        if _proxy_skip_raw.strip().lower() in ("true", "1", "yes", "on"):
+            _fname = files[0][1][0] if files else "<no file>"
+            _stats_set(request, doc_type="SKIPPED", pipeline="skip")
+            _total_ms = (time.time() - _t_total) * 1000
+            logger.info(f"[rid={_rid8}] Proxy skip: {_fname} -> not forwarded to docling")
+            logger.info(f"TIMING total: {_total_ms:.0f}ms  status: 200 (proxy_skip)")
+            return Response(
+                content=json.dumps(
+                    {
+                        "status": "success",
+                        "document": {"md_content": ""},
+                        "proxy_diagnostics": {
+                            "proxy_skipped": True,
+                            "request_id": _request_id,
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                status_code=200,
+                headers={"content-type": "application/json"},
+            )
+
         for fi, (_, (fname, fbytes, ftype)) in enumerate(files):
             ext = os.path.splitext(fname)[1].lower() if fname else ""
             _stats_set(request, filename=fname, file_size_bytes=len(fbytes) if fbytes else None)
