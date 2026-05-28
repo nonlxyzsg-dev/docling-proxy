@@ -7,7 +7,7 @@ from proxy.config import (
     DEFAULT_VLM_MAX_CONCURRENT_DOCS, DEFAULT_VLM_CONCURRENCY,
     DEFAULT_IMAGES_SCALE,
     DOCLING_RETRY_MAX_ATTEMPTS, DOCLING_RETRY_BACKOFF_SEC,
-    OCR_SDK_ENABLED,
+    OCR_SDK_ENABLED, ARCHIVE_PROCESSING_ENABLED,
     _resolve_int_threshold, _resolve_bool_flag,
 )
 from proxy.routing import (
@@ -26,6 +26,8 @@ from proxy.builders import (
 from proxy.post_process import fix_katex_compatibility
 from proxy.stats import _stats_set
 from proxy.dispatch import run_docling_request
+from proxy.archive_extract import is_archive
+from proxy.archive import handle_archive
 
 
 logger = logging.getLogger("docling_proxy")
@@ -107,6 +109,20 @@ async def proxy(request: Request, path: str):
                 ).encode("utf-8"),
                 status_code=200,
                 headers={"content-type": "application/json"},
+            )
+
+        # Распаковка архивов: если среди загруженных файлов есть архив
+        # (zip/tar/7z/rar) — разворачиваем его рекурсивно и обрабатываем каждый
+        # вложенный документ как отдельную загрузку, склеивая результат в один
+        # markdown. Подробно — proxy/archive.py, README.md раздел «Архивы».
+        if ARCHIVE_PROCESSING_ENABLED and any(
+            is_archive(f[1][0], f[1][1]) for f in files
+        ):
+            return await handle_archive(
+                client=client, request=request, target_url=target_url,
+                files=files, data=data,
+                vlm_overrides=vlm_overrides, routing_overrides=routing_overrides,
+                rid8=_rid8, request_id=_request_id, t_total=_t_total,
             )
 
         for fi, (_, (fname, fbytes, ftype)) in enumerate(files):

@@ -252,3 +252,22 @@ VLM_FULL_PAGE_SAMPLING = _load_sampling_profile("VLM_FULL_PAGE")
 VLM_PICTURE_DESC_SAMPLING = _load_sampling_profile("VLM_PICTURE_DESC")
 
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
+
+# ── Распаковка архивов (zip / tar / 7z / rar, рекурсивно) ──
+# Workaround поверх docling: docling-serve не умеет принимать архив и
+# обрабатывать его содержимое. Прокси разворачивает архив (включая вложенные),
+# прогоняет каждый поддерживаемый документ через обычный пайплайн обработки
+# и склеивает результат в один markdown. Подробно — README.md, раздел «Архивы».
+#
+# zip и tar-семейство (tar/tar.gz/tgz/tar.bz2/tar.xz) — через stdlib, без
+# доп. зависимостей. 7z требует py7zr, rar — rarfile + системный бинарник
+# unrar/bsdtar. Если библиотека/бинарник недоступны — соответствующий архив
+# помечается как необработанный (не падаем).
+ARCHIVE_PROCESSING_ENABLED = _env_bool("ARCHIVE_PROCESSING_ENABLED", default=True)
+# Максимальная глубина вложенности (архив в архиве). Защита от рекурсивных бомб.
+ARCHIVE_MAX_DEPTH = _env_int("ARCHIVE_MAX_DEPTH", 5)
+# Максимальное число извлекаемых файлов суммарно по всему дереву.
+ARCHIVE_MAX_FILES = _env_int("ARCHIVE_MAX_FILES", 200)
+# Максимальный суммарный распакованный объём (защита от zip-бомб), МБ.
+ARCHIVE_MAX_TOTAL_MB = _env_int("ARCHIVE_MAX_TOTAL_MB", 500)
+ARCHIVE_MAX_TOTAL_BYTES = ARCHIVE_MAX_TOTAL_MB * 1024 * 1024

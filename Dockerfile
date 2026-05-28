@@ -11,9 +11,21 @@ WORKDIR /proxy
 # в `docker compose logs` сразу, что мешает диагностике в реальном времени.
 ENV PYTHONUNBUFFERED=1
 
-# Локальные пакеты (не зависим от PyPI)
+# Системные бинарники для распаковки rar/7z (rarfile вызывает их во время
+# выполнения). py7zr — чистый Python, бинарник ему не нужен. Если apt в среде
+# сборки недоступен — строку можно убрать: код деградирует мягко и помечает
+# rar/7z как необработанные. zip и tar-семейство работают через stdlib всегда.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        p7zip-full unar \
+    && rm -rf /var/lib/apt/lists/*
+
+# Локальные пакеты (не зависим от PyPI).
+# py7zr и rarfile нужны для .7z и .rar. Их (и транзитивные зависимости py7zr:
+# pycryptodomex, pyzstd, pyppmd, pybcj, multivolumefile, inflate64, brotli,
+# texttable) необходимо предварительно положить в wheels/. Если каких-то
+# wheel'ов нет — уберите py7zr/rarfile из строки: zip/tar продолжат работать.
 COPY wheels/ /tmp/wheels/
-RUN pip install --no-index --find-links=/tmp/wheels/ pymupdf xlrd docxlatex
+RUN pip install --no-index --find-links=/tmp/wheels/ pymupdf xlrd docxlatex py7zr rarfile
 
 # Код и конфиг
 COPY .env .
