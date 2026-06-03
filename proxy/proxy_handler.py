@@ -125,6 +125,11 @@ async def proxy(request: Request, path: str):
                 rid8=_rid8, request_id=_request_id, t_total=_t_total,
             )
 
+        # ⚠️ ДУБЛЬ РОУТИНГА: этот блок (спец-конвертеры XLS/DOC, выбор пайплайна
+        # PDF scan/threshold/OCR-SDK/DOCX-OLE, инжекция параметров) зеркалится в
+        # proxy/archive.py::_convert_member для файлов из архивов. При любом
+        # изменении роутинга/пайплайна синхронизируй ОБА места. План слияния в
+        # одно ядро (proxy/doc_pipeline.py) — отложен, см. историю обсуждения.
         for fi, (_, (fname, fbytes, ftype)) in enumerate(files):
             ext = os.path.splitext(fname)[1].lower() if fname else ""
             _stats_set(request, filename=fname, file_size_bytes=len(fbytes) if fbytes else None)

@@ -131,7 +131,11 @@ async def _convert_member(
     Возвращает dict: filename, status (ok|unsupported|error), md, note,
     size (исходный размер в байтах), pages (число страниц, где дёшево —
     PDF и docx→PDF, иначе None).
-    Зеркалит роутинг proxy_handler.proxy(), но отдаёт markdown, а не Response.
+
+    ⚠️ ДУБЛЬ РОУТИНГА: спец-конвертеры XLS/DOC, выбор пайплайна (PDF
+    scan/threshold/OCR-SDK/DOCX-OLE) и инжекция параметров здесь зеркалят
+    proxy_handler.proxy(). При любом изменении роутинга/пайплайна синхронизируй
+    ОБА места. План слияния в одно ядро (proxy/doc_pipeline.py) — отложен.
     """
     ext = os.path.splitext(fname)[1].lower() if fname else ""
     _orig_size = len(fbytes) if fbytes else 0
