@@ -147,6 +147,23 @@ TEXT_PDF_VLM_THRESHOLD_SOURCE = "env" if (os.environ.get("TEXT_PDF_VLM_THRESHOLD
 _SCAN_PDF_FULL_PAGE_DEFAULT = True
 SCAN_PDF_FULL_PAGE = _env_bool("SCAN_PDF_FULL_PAGE", default=_SCAN_PDF_FULL_PAGE_DEFAULT)
 SCAN_PDF_FULL_PAGE_SOURCE = "env" if (os.environ.get("SCAN_PDF_FULL_PAGE") or "").strip() else "default"
+
+# ── Детектор скана (is_scan_pdf) ──
+# Метрика "scan vs text": считаем БУКВЫ (alphabetic, unicode — кириллица/
+# латиница), а не сырую длину. Причина: PDF из "Print To PDF" с телом в
+# CID-шрифтах без ToUnicode отдаёт через extractable-слой только цифры/
+# реквизиты (из шрифта с рабочей кодировкой) — по сырой длине это проходит
+# порог и маскирует неизвлекаемое тело → документ ошибочно уходит в standard
+# вместо распознавания. Буквы на таких страницах ≈ 0 → корректно ловится скан.
+# Сэмплируем равномерно по всему документу, а не только первые страницы.
+#
+# SCAN_TEXT_METRIC: letters (по умолчанию) | chars (legacy, мгновенный откат
+# к старому поведению по сырой длине через .env, без отката кода).
+SCAN_TEXT_METRIC = (os.getenv("SCAN_TEXT_METRIC", "letters").strip().lower() or "letters")
+SCAN_MIN_LETTERS_PER_PAGE = _env_int("SCAN_MIN_LETTERS_PER_PAGE", 50)
+SCAN_MIN_CHARS_PER_PAGE = _env_int("SCAN_MIN_CHARS_PER_PAGE", 100)  # для legacy-режима chars
+SCAN_DETECT_PAGES = _env_int("SCAN_DETECT_PAGES", 10)  # сколько страниц сэмплировать (равномерно)
+
 # scale для VLM-пайплайнов (build_vlm_pipeline_model_api и build_custom_model).
 DEFAULT_VLM_SCALE = _env_float("DEFAULT_VLM_SCALE", 1.5)
 # images_scale для standard-пайплайна: реально влияет на разрешение картинок,

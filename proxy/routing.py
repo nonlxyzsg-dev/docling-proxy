@@ -1,25 +1,64 @@
 """Routing helpers: PDF type detection, Confluence/OLE handling, processing warnings."""
-import os, math, fitz, zipfile, logging, httpx
-from proxy.config import GOTENBERG_URL, OCR_SDK_ENABLED
+import os, re, math, fitz, zipfile, logging, httpx
+from proxy.config import (
+    GOTENBERG_URL, OCR_SDK_ENABLED,
+    SCAN_TEXT_METRIC, SCAN_MIN_LETTERS_PER_PAGE, SCAN_MIN_CHARS_PER_PAGE,
+    SCAN_DETECT_PAGES,
+)
 
 logger = logging.getLogger("docling_proxy")
 
-def is_scan_pdf(pdf_bytes: bytes, min_chars_per_page: int = 100, pages_to_check: int = 3) -> bool:
-    """Check if PDF is a scan (no/little extractable text)."""
+# Буква: любой alphabetic-символ unicode (кириллица/латиница/…), НЕ цифра,
+# НЕ '_', НЕ пунктуация/пробел.
+_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def _sample_page_indices(n: int, k: int) -> list:
+    """k индексов страниц, равномерно по всему документу (не только первые)."""
+    if n <= k:
+        return list(range(n))
+    return sorted({int(i * n / k) for i in range(k)})
+
+
+def is_scan_pdf(pdf_bytes: bytes, min_letters_per_page: int = None, pages_to_check: int = None) -> bool:
+    """Скан ли PDF (мало извлекаемого ТЕКСТА).
+
+    Метрика — количество БУКВ на странице (alphabetic, unicode), а не сырая
+    длина: цифры/реквизиты из шрифта с рабочей кодировкой не должны маскировать
+    неизвлекаемое тело в CID-шрифтах без ToUnicode. Сэмплируем равномерно по
+    всему документу. Режим chars (legacy) — откат к сырой длине через .env.
+    """
+    metric = SCAN_TEXT_METRIC
+    k = SCAN_DETECT_PAGES if pages_to_check is None else pages_to_check
+    if metric == "chars":
+        threshold = SCAN_MIN_CHARS_PER_PAGE
+    else:
+        threshold = SCAN_MIN_LETTERS_PER_PAGE if min_letters_per_page is None else min_letters_per_page
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pages_checked = min(len(doc), pages_to_check)
-        if pages_checked == 0:
+        n = len(doc)
+        if n == 0:
             doc.close()
             return False
-        total_chars = 0
-        for i in range(pages_checked):
-            text = doc[i].get_text().strip()
-            total_chars += len(text)
+        idxs = _sample_page_indices(n, max(k, 1))
+        total = 0
+        for i in idxs:
+            text = doc[i].get_text()
+            if metric == "chars":
+                total += len(text.strip())
+            else:
+                total += sum(1 for _ in _LETTER_RE.finditer(text))
         doc.close()
-        avg_chars = total_chars / pages_checked
-        return avg_chars < min_chars_per_page
-    except Exception:
+        pages = len(idxs) or 1
+        avg = total / pages
+        is_scan = avg < threshold
+        logger.info(
+            f"[scan-detect] metric={metric} pages_sampled={pages}/{n} "
+            f"avg={avg:.1f} threshold={threshold} -> {'SCAN' if is_scan else 'TEXT'}"
+        )
+        return is_scan
+    except Exception as e:
+        logger.warning(f"[scan-detect] failed ({type(e).__name__}: {e}) -> TEXT")
         return False
 
 
