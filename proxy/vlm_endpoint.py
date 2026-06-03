@@ -12,6 +12,7 @@ from proxy.config import (
 from proxy.prompts import VLM_FULL_PAGE_PROMPT, VLM_PICTURE_DESC_PROMPT
 from proxy.error_handling import _classify_error_type
 from proxy.image_resize import resize_images_in_messages, summarize_resize_stats
+from proxy.vlm_admission import gate
 
 logger = logging.getLogger("docling_proxy")
 
@@ -375,12 +376,20 @@ async def vlm_chat_completions(request: Request):
     )
 
     client: httpx.AsyncClient = request.app.state.client
+    # Адаптивный capacity gate: придерживаем форвард, пока модель насыщена
+    # (см. proxy/vlm_admission.py). gate_wait_ms — время ожидания в гейте,
+    # _t — момент собственно форварда (elapsed_ms считаем только upstream).
+    _gate_wait_ms = 0
+    _gate_last_resort = False
     _t = time.time()
     try:
-        upstream_resp = await client.post(
-            VLM_UPSTREAM_URL, json=body, headers=headers,
-            timeout=httpx.Timeout(1200.0, connect=10.0),
-        )
+        async with gate.admit(rid8) as _gate_last_resort:
+            _gate_wait_ms = int((time.time() - _t) * 1000)
+            _t = time.time()
+            upstream_resp = await client.post(
+                VLM_UPSTREAM_URL, json=body, headers=headers,
+                timeout=httpx.Timeout(1200.0, connect=10.0),
+            )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         elapsed_ms = int((time.time() - _t) * 1000)
         err_type = _classify_error_type(exc, None)
@@ -399,6 +408,8 @@ async def vlm_chat_completions(request: Request):
             "completion_tokens": None,
             "finish_reason": None,
             "elapsed_ms": elapsed_ms,
+            "gate_wait_ms": _gate_wait_ms,
+            "gate_last_resort": _gate_last_resort,
             "status": "error",
             "error": f"{err_type}: {type(exc).__name__}",
         }
@@ -453,6 +464,8 @@ async def vlm_chat_completions(request: Request):
         "completion_tokens": completion_tokens,
         "finish_reason": finish_reason,
         "elapsed_ms": elapsed_ms,
+        "gate_wait_ms": _gate_wait_ms,
+        "gate_last_resort": _gate_last_resort,
         "status": status,
         "upstream_status": upstream_status,
     }
@@ -501,7 +514,9 @@ async def vlm_chat_completions(request: Request):
     else:
         logger.info(
             f"[vlm rid={rid8}] upstream {upstream_status} finish={_fr} "
-            f"tokens={_ct}/{_pt} elapsed={elapsed_ms}ms status=ok"
+            f"tokens={_ct}/{_pt} elapsed={elapsed_ms}ms "
+            f"gate_wait={_gate_wait_ms}ms{' last_resort' if _gate_last_resort else ''} "
+            f"status=ok"
         )
 
     resp_headers = {"X-Request-ID": request_id}
@@ -512,4 +527,14 @@ async def vlm_chat_completions(request: Request):
         content=upstream_resp.content,
         status_code=upstream_status,
         headers=resp_headers,
+    )
+
+
+@router.get("/_gate")
+async def vlm_gate_state():
+    """Текущее состояние адаптивного capacity gate — для тюнинга порогов."""
+    return Response(
+        content=json.dumps(gate.snapshot(), ensure_ascii=False).encode("utf-8"),
+        status_code=200,
+        headers={"content-type": "application/json"},
     )

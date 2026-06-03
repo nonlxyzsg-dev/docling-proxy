@@ -36,6 +36,7 @@ from proxy.stats import (
     router as stats_router,
 )
 from proxy.vlm_endpoint import router as vlm_router
+from proxy.vlm_admission import gate as vlm_gate
 from proxy.proxy_handler import router as proxy_router
 
 logger = logging.getLogger("docling_proxy")
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI):
         f"propagate={_ua.propagate}"
     )
     app.state.client = make_async_client()
+    # Адаптивный capacity gate: фоновый поллер vLLM /metrics + допускающая логика
+    # вокруг исходящих VLM-запросов (см. proxy/vlm_admission.py).
+    vlm_gate.start(app.state.client)
     cleanup_old_inbox_files()
     cleanup_task = asyncio.create_task(_periodic_inbox_cleanup())
     cleanup_old_vlm_request_logs()
@@ -131,6 +135,7 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     logs_cleanup_task.cancel()
     truncate_cleanup_task.cancel()
+    await vlm_gate.stop()
 
     if app.state.stats_queue is not None:
         try:

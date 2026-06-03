@@ -127,6 +127,42 @@ Streaming (`stream: true`) сейчас не поддерживается — en
 
 ---
 
+## Adaptive VLM gate
+
+Все VLM-запросы (full-page + picture_description) идут через gateway → LiteLLM → vLLM (единственный инстанс). Раньше docling-serve веером слал до `vlm_concurrency` постраничных запросов, gateway форвардил без ограничения → переполнение очереди vLLM, таймауты у параллельных пользователей и холостая доработка отвалившихся запросов.
+
+Gateway адаптивно **придерживает форвард ровно настолько, насколько занята модель** — не фиксированный потолок, а допуск по реальной ёмкости.
+
+**Сигнал ёмкости** — Prometheus `/metrics` инстанса vLLM (`VLM_METRICS_URL`, опрос каждые `VLM_METRICS_POLL_MS`, кэш):
+- `vllm:kv_cache_usage_perc` — главный лимитер (доля 0..1);
+- `vllm:num_requests_waiting` — backlog (>0 = модель уже копит очередь);
+- `vllm:num_requests_running` — текущий батч (для самокалибровки KV/запрос).
+
+**Правило допуска:** форвардим немедленно, пока `num_requests_waiting <= VLM_GATE_WAITING_MAX` **И** `eff_kv < VLM_GATE_KV_THRESHOLD`. Иначе — ждём внутри proxy и отпускаем, как только запас вернулся (поллер будит ждущих каждые ~`POLL_MS`, плюс пробуждение на освобождение слота).
+
+**Анти-овершут:** между опросами держим счётчик допущенных и оценку KV/запрос (`kv/running`, самокалибровка; при `running=0` — `VLM_GATE_DEFAULT_PER_REQ_KV`). `eff_kv = snapshot_kv + admitted_since_poll × per_req_kv` — пачка одновременных запросов не проскочит разом по устаревшему чтению.
+
+**Бюджет ожидания:** придерживаем до `VLM_GATE_LAST_RESORT_FRACTION × VLM_GATE_WAIT_BUDGET_SEC` (по умолчанию 0.8×600 = 480 c), затем — **last-resort форвард** с `WARNING` (страницу не дропаем — пропущенная молча портит документ; пусть уходит в очередь vLLM). Бюджет согласован с `DEFAULT_VLM_TIMEOUT` (поднят 300→600), иначе таймаут docling→gateway просто переедет на этот уровень.
+
+**Fallback:** `/metrics` недоступен дольше `VLM_METRICS_STALE_MS` → локальный кап `VLM_GATE_FALLBACK_MAX_INFLIGHT` (не блокируем намертво).
+
+**Rollback:** `VLM_GATE_ENABLED=false` → форвард без ожидания, поведение 1:1 как до фичи.
+
+**Тюнинг и диагностика:** `GET /_gate` отдаёт текущее состояние (in_flight, снапшот метрик, пороги). В JSONL `vlm_requests_*.jsonl` и в логе запроса — `gate_wait_ms` и `gate_last_resort`. Параллельно стоит снизить `DEFAULT_VLM_CONCURRENCY` до ≈ постраничной ёмкости (старт 16–24): тогда docling сам пейсит, а gate ловит в основном перелив между источниками.
+
+| Параметр (ENV) | Дефолт | Смысл |
+|---|---|---|
+| `VLM_GATE_ENABLED` | `true` | вкл/выкл гейта (false → passthrough) |
+| `VLM_METRICS_URL` | `…:9989/metrics` | источник сигнала (напрямую vLLM) |
+| `VLM_METRIC_KV/RUNNING/WAITING` | `vllm:*` | имена метрик (под смену версии/движка) |
+| `VLM_GATE_KV_THRESHOLD` | `0.85` | порог KV-cache |
+| `VLM_GATE_WAITING_MAX` | `0` | допуск пока waiting≤W (2–4 → больше throughput) |
+| `VLM_GATE_FALLBACK_MAX_INFLIGHT` | `24` | кап при недоступных метриках |
+| `VLM_GATE_WAIT_BUDGET_SEC` | `600` | бюджет ожидания |
+| `VLM_GATE_LAST_RESORT_FRACTION` | `0.8` | доля бюджета до last-resort |
+
+---
+
 ## PDF routing
 
 Прокси автоматически выбирает pipeline для каждого PDF между `vlm` (full-page OCR через Qwen3.5-122B) и `standard` (текстовое извлечение + picture description). Решение зависит от типа документа (SCAN / TEXT) и числа страниц.

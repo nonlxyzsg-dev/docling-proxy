@@ -251,6 +251,49 @@ def _load_sampling_profile(prefix: str) -> dict:
 VLM_FULL_PAGE_SAMPLING = _load_sampling_profile("VLM_FULL_PAGE")
 VLM_PICTURE_DESC_SAMPLING = _load_sampling_profile("VLM_PICTURE_DESC")
 
+# ── Адаптивный контроль исходящих VLM-запросов (capacity gate) ──
+# Gateway придерживает форвард в LiteLLM/vLLM ровно настолько, насколько занята
+# модель — сигнал берём из Prometheus /metrics инстанса vLLM. Цель: грузить
+# модель до реальной ёмкости (есть слот — занимаем), но не растить хвост в
+# очереди самого vLLM. Подробно — README.md «Adaptive VLM gate».
+#
+# Флаг отключения: VLM_GATE_ENABLED=false → форвард без ожидания (поведение 1:1
+# как до фичи), безопасный rollback.
+VLM_GATE_ENABLED = _env_bool("VLM_GATE_ENABLED", default=True)
+# Источник сигнала ёмкости. URL напрямую на vLLM (НЕ LiteLLM :4000 — у него
+# свой формат). Auth не нужен — /metrics открыт.
+VLM_METRICS_URL = os.getenv("VLM_METRICS_URL", "http://10.121.3.190:9989/metrics")
+# Имена метрик (vLLM). Внимание: в этой версии vLLM именно kv_cache_usage_perc,
+# а не gpu_cache_usage_perc. Вынесены в ENV на случай смены движка/версии.
+VLM_METRIC_RUNNING = os.getenv("VLM_METRIC_RUNNING", "vllm:num_requests_running")
+VLM_METRIC_WAITING = os.getenv("VLM_METRIC_WAITING", "vllm:num_requests_waiting")
+VLM_METRIC_KV = os.getenv("VLM_METRIC_KV", "vllm:kv_cache_usage_perc")
+# Период опроса /metrics (мс) и таймаут одного запроса (мс).
+VLM_METRICS_POLL_MS = _env_int("VLM_METRICS_POLL_MS", 300)
+VLM_METRICS_TIMEOUT_MS = _env_int("VLM_METRICS_TIMEOUT_MS", 1000)
+# Возраст снапшота (мс), после которого данные считаем устаревшими и
+# переходим в fallback-режим (локальный кап).
+VLM_METRICS_STALE_MS = _env_int("VLM_METRICS_STALE_MS", 2000)
+# Порог KV-cache (доля 0..1): пока eff_kv < порога — есть запас.
+VLM_GATE_KV_THRESHOLD = _env_float("VLM_GATE_KV_THRESHOLD", 0.85)
+# Допускаем, пока waiting <= W. W=0 — строго без backlog; 2–4 держит GPU
+# «накормленным» на максимум throughput. Тюнится по /metrics.
+VLM_GATE_WAITING_MAX = _env_int("VLM_GATE_WAITING_MAX", 0)
+# Оценка KV/запрос, когда running==0 (нечем самокалиброваться). Анти-овершут
+# для холодного старта пачки.
+VLM_GATE_DEFAULT_PER_REQ_KV = _env_float("VLM_GATE_DEFAULT_PER_REQ_KV", 0.02)
+# Fallback-кап одновременных in-flight, когда метрики недоступны/устарели.
+# НЕ постоянный потолок: работает только в режиме «метрики недоступны».
+VLM_GATE_FALLBACK_MAX_INFLIGHT = _env_int("VLM_GATE_FALLBACK_MAX_INFLIGHT", 24)
+# Бюджет ожидания в гейте (сек) и доля, после которой — last-resort форвард
+# (страницу не дропаем; пусть уйдёт в очередь vLLM + WARNING-сигнал перегрузки).
+# Бюджет согласован с таймаутом docling→gateway (DEFAULT_VLM_TIMEOUT): держим
+# меньше, иначе таймаут переедет сюда.
+VLM_GATE_WAIT_BUDGET_SEC = _env_float("VLM_GATE_WAIT_BUDGET_SEC", 600.0)
+VLM_GATE_LAST_RESORT_FRACTION = _env_float("VLM_GATE_LAST_RESORT_FRACTION", 0.8)
+# Как часто ждущий перепроверяет ёмкость, если его не разбудили событием (мс).
+VLM_GATE_RECHECK_MS = _env_int("VLM_GATE_RECHECK_MS", 100)
+
 ENRICH_LABELS = {"image", "chart", "engineering_drawing", "cad_drawing", "electrical_diagram", "seal", "stamp"}
 
 # ── Распаковка архивов (zip / tar / 7z / rar, рекурсивно) ──
