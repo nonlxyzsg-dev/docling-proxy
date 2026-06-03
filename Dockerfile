@@ -30,6 +30,9 @@ RUN pip install --no-index --find-links=/tmp/wheels/ pymupdf xlrd docxlatex py7z
 # Код и конфиг
 COPY .env .
 COPY main.py .
+# Пакет proxy/ — без него main.py падает на `from proxy.config import ...`.
+# WORKDIR=/proxy, импорт идёт как `proxy.*`, поэтому кладём в /proxy/proxy/.
+COPY proxy/ ./proxy/
 # Конфиг логирования uvicorn (timestamps + level + name) — иначе uvicorn
 # ставит свои handlers ПОСЛЕ импорта main.py и наш ретрофит из lifespan
 # может не сработать.
