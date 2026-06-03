@@ -11,13 +11,10 @@ WORKDIR /proxy
 # в `docker compose logs` сразу, что мешает диагностике в реальном времени.
 ENV PYTHONUNBUFFERED=1
 
-# Системные бинарники для распаковки rar/7z (rarfile вызывает их во время
-# выполнения). py7zr — чистый Python, бинарник ему не нужен. Если apt в среде
-# сборки недоступен — строку можно убрать: код деградирует мягко и помечает
-# rar/7z как необработанные. zip и tar-семейство работают через stdlib всегда.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        p7zip-full unar \
-    && rm -rf /var/lib/apt/lists/*
+# Системные бинарники для rar НЕ ставим: базовый образ — CentOS Stream 9,
+# и в нём уже есть /usr/bin/bsdtar (libarchive 3.5.x читает RAR4/RAR5).
+# rarfile подхватывает bsdtar автоматически. 7z — через py7zr (чистый Python),
+# zip/tar — stdlib. Если в будущем понадобится системный пакет — это dnf, не apt.
 
 # Локальные пакеты (не зависим от PyPI).
 # py7zr и rarfile нужны для .7z и .rar. Их (и транзитивные зависимости py7zr:
