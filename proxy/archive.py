@@ -39,7 +39,7 @@ from proxy.builders import (
 from proxy.post_process import fix_katex_compatibility
 from proxy.stats import _stats_set
 from proxy.dispatch import run_docling_request
-from proxy.archive_extract import is_archive, extract_archive
+from proxy.archive_extract import is_archive, extract_archive, archive_kind
 
 logger = logging.getLogger("docling_proxy")
 
@@ -128,21 +128,29 @@ async def _convert_member(
 ) -> dict:
     """Обработать один извлечённый файл как обычную загрузку.
 
-    Возвращает {"filename", "status": ok|unsupported|error, "md", "note"}.
+    Возвращает dict: filename, status (ok|unsupported|error), md, note,
+    size (исходный размер в байтах), pages (число страниц, где дёшево —
+    PDF и docx→PDF, иначе None).
     Зеркалит роутинг proxy_handler.proxy(), но отдаёт markdown, а не Response.
     """
     ext = os.path.splitext(fname)[1].lower() if fname else ""
+    _orig_size = len(fbytes) if fbytes else 0
+    _pages = None
+
+    def _r(status, md=None, note=None):
+        return {"filename": fname, "status": status, "md": md, "note": note,
+                "size": _orig_size, "pages": _pages}
 
     if ext and ext not in SUPPORTED_EXTENSIONS:
         logger.info(f"[rid={rid8}] archive member {fname}: unsupported ({ext}), skip")
-        return {"filename": fname, "status": "unsupported", "md": None}
+        return _r("unsupported")
 
     # XLS — нативная конвертация.
     if ext == ".xls":
         res = convert_xls_to_markdown(fbytes, fname)
         md = _md_from_json_bytes(res) if res else None
         if md is not None:
-            return {"filename": fname, "status": "ok", "md": md}
+            return _r("ok", md=md)
         logger.warning(f"[rid={rid8}] archive member {fname}: XLS convert failed")
 
     # DOC — Confluence-HTML или бинарный .doc через Gotenberg.
@@ -152,13 +160,12 @@ async def _convert_member(
             if html_bytes:
                 fname, fbytes, ext = html_name, html_bytes, ".html"
             else:
-                return {"filename": fname, "status": "error", "md": None,
-                        "note": "не удалось извлечь HTML из Confluence-экспорта."}
+                return _r("error", note="не удалось извлечь HTML из Confluence-экспорта.")
         else:
             res = await convert_doc_to_markdown(client, fbytes, fname)
             md = _md_from_json_bytes(res) if res else None
             if md is not None:
-                return {"filename": fname, "status": "ok", "md": md}
+                return _r("ok", md=md)
             logger.warning(f"[rid={rid8}] archive member {fname}: DOC convert failed")
 
     # Выбор пайплайна.
@@ -172,13 +179,14 @@ async def _convert_member(
             _pdf.close()
         except Exception as e:
             logger.warning(f"[rid={rid8}] archive member {fname}: page count failed: {e}")
+        _pages = _page_count or None
 
         if _is_scan and OCR_SDK_ENABLED:
             sdk_res = await convert_scan_via_ocr_sdk(client, fbytes, fname, vlm_overrides)
             if sdk_res is not None:
                 md = _md_from_json_bytes(fix_katex_compatibility(sdk_res))
                 if md is not None:
-                    return {"filename": fname, "status": "ok", "md": md}
+                    return _r("ok", md=md)
             logger.warning(f"[rid={rid8}] archive member {fname}: OCR SDK fallback")
 
         _vpt, _ = _resolve_int_threshold(
@@ -209,6 +217,12 @@ async def _convert_member(
                 fname = fname.rsplit(".", 1)[0] + ".pdf"
                 fbytes = pdf_bytes
                 pipeline_value = "vlm"
+                try:
+                    _pdf = fitz.open(stream=fbytes, filetype="pdf")
+                    _pages = len(_pdf) or None
+                    _pdf.close()
+                except Exception:
+                    pass
                 logger.info(f"[rid={rid8}] archive member {fname}: OLE -> Gotenberg -> vlm")
             except Exception as e:
                 pipeline_value = "standard"
@@ -229,21 +243,113 @@ async def _convert_member(
     )
     md = _md_from_response(resp)
     if resp.status_code == 200 and md is not None:
-        return {"filename": fname, "status": "ok", "md": md}
-    return {"filename": fname, "status": "error", "md": None,
-            "note": f"docling вернул статус {resp.status_code}."}
+        return _r("ok", md=md)
+    return _r("error", note=f"docling вернул статус {resp.status_code}.")
+
+
+_STATUS_ICON = {"ok": "✅", "unsupported": "⏭️", "error": "⚠️"}
+
+
+def _human_size(n: int) -> str:
+    """Человекочитаемый размер: 8 КБ, 1.4 МБ и т.п."""
+    if not n:
+        return ""
+    units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+    s = float(n)
+    i = 0
+    while s >= 1024 and i < len(units) - 1:
+        s /= 1024
+        i += 1
+    if i == 0:
+        return f"{int(s)} {units[i]}"
+    return f"{s:.1f}".rstrip("0").rstrip(".") + f" {units[i]}"
+
+
+def _meta_str(r: dict) -> str:
+    """Строка метаданных файла: страницы + размер (+ причина для skip/error)."""
+    bits = []
+    if r.get("pages"):
+        bits.append(f"{r['pages']} стр.")
+    size = _human_size(r.get("size") or 0)
+    if size:
+        bits.append(size)
+    if r["status"] == "unsupported":
+        bits.append("формат не поддерживается")
+    elif r["status"] == "error":
+        bits.append(r.get("note") or "ошибка обработки")
+    return " · ".join(bits)
+
+
+def _build_tree(results: list) -> dict:
+    """Собрать дерево из плоских путей вида archive.zip/dir/file.pdf.
+
+    Промежуточные узлы (архивы/папки) — dict, листья — ("leaf", result).
+    """
+    tree: dict = {}
+    for r in results:
+        parts = r["filename"].split("/")
+        node = tree
+        for p in parts[:-1]:
+            sub = node.get(p)
+            if not isinstance(sub, dict):
+                sub = {}
+                node[p] = sub
+            node = sub
+        node[parts[-1]] = ("leaf", r)
+    return tree
+
+
+def _render_tree(tree: dict, depth: int, lines: list):
+    for name, val in tree.items():
+        indent = "  " * depth
+        if isinstance(val, tuple):  # лист — файл
+            r = val[1]
+            icon = _STATUS_ICON.get(r["status"], "•")
+            meta = _meta_str(r)
+            lines.append(f"{indent}- {icon} {name}" + (f" — {meta}" if meta else ""))
+        else:  # ветка — архив или папка
+            node_icon = "📦" if archive_kind(name) else "📁"
+            lines.append(f"{indent}- {node_icon} {name}")
+            _render_tree(val, depth + 1, lines)
 
 
 def _merge_markdown(top_name: str, results: list, notes: list) -> str:
-    """Склеить markdown всех файлов в один документ с разделителями."""
+    """Склеить markdown всех файлов: сводный манифест сверху + документы ниже.
+
+    Манифест (дерево состава, статусы, страницы/объёмы, нераспакованное) даёт
+    модели/человеку и человеку карту архива; под каждым документом — мета-строка
+    с источником для провенанса в векторном хранилище.
+    """
     ok = sum(1 for r in results if r["status"] == "ok")
-    parts = [
-        f"# Содержимое архива: {top_name}",
-        "",
-        f"_Файлов обработано: {ok} из {len(results)}._",
-    ]
+    skipped = sum(1 for r in results if r["status"] == "unsupported")
+    errored = sum(1 for r in results if r["status"] == "error")
+
+    parts = [f"# Содержимое архива: {top_name}", ""]
+    parts.append(
+        f"**Итог:** обработано {ok}, пропущено {skipped}, с ошибкой {errored}; "
+        f"всего {len(results)} файл(ов)."
+    )
+
+    # Сводный манифест — дерево состава архива.
+    parts.extend(["", "## Состав архива", ""])
+    if results:
+        tree_lines: list = []
+        _render_tree(_build_tree(results), 0, tree_lines)
+        parts.extend(tree_lines)
+    else:
+        parts.append("_(нет файлов для обработки)_")
+
+    # Нераспакованное (битые/недоступные субархивы, сработавшие лимиты).
+    if notes:
+        parts.extend(["", "**Не удалось распаковать:**", ""])
+        parts.extend(f"- {n}" for n in notes)
+
+    # Сами документы с разделителями и мета-строкой-источником.
     for r in results:
+        meta = _meta_str(r)
         parts.extend(["", "---", "", f"## 📄 {r['filename']}", ""])
+        if meta:
+            parts.extend([f"_Источник: {r['filename']} · {meta}_", ""])
         if r["status"] == "ok" and r["md"]:
             parts.append(r["md"])
         elif r["status"] == "ok":
@@ -252,9 +358,7 @@ def _merge_markdown(top_name: str, results: list, notes: list) -> str:
             parts.append("_⚠️ Формат файла не поддерживается — пропущен._")
         else:
             parts.append(f"_⚠️ {r.get('note') or 'не удалось обработать файл.'}_")
-    if notes:
-        parts.extend(["", "---", "", "## Примечания", ""])
-        parts.extend(f"- {n}" for n in notes)
+
     return "\n".join(parts)
 
 
